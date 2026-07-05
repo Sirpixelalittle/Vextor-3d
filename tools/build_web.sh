@@ -25,7 +25,12 @@ if [[ ! -x "$BINDGEN" ]]; then
 fi
 
 echo "==> cargo build (wasm32-unknown-unknown, release)"
-cargo build --release -p arena --target wasm32-unknown-unknown
+# LTO off for wasm only: CachyOS bakes `target-cpu=x86-64-v3` into the
+# rust-wasm std's bitcode, and cross-crate LTO re-codegens it, spamming
+# "'x86-64-v3' is not a recognized processor" (harmless but noisy).
+# Native builds keep the workspace thin-LTO profile.
+cargo build --release -p arena --target wasm32-unknown-unknown \
+    --config 'profile.release.lto="off"'
 
 echo "==> wasm-bindgen (CLI $($BINDGEN --version | cut -d' ' -f2), lock $LOCKED)"
 rm -rf dist-web
