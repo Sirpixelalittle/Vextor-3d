@@ -165,7 +165,8 @@ Humans may also enjoy it.
 ## Provenance
 
 Designed and built over a handful of days as a human ↔ AI collaboration:
-direction, playtesting, and taste by [Sirpixelalot]; architecture and
+direction, playtesting, and taste by
+[Sirpixelalittle](https://github.com/Sirpixelalittle); architecture and
 implementation driven through Claude (Anthropic) in a continuous session —
 including the design document ([DESIGN.md](DESIGN.md)), which was written
 before the first line of code and still matches what shipped, milestone
