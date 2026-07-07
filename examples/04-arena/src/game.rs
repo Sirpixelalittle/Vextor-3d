@@ -159,8 +159,10 @@ pub const BOSS_CYCLE: f32 = BOSS_CLOSED_SECONDS + BOSS_OPEN_SECONDS;
 const BOSS_OPEN_RAMP: f32 = 0.6;
 /// How high the crown lifts off the base (world units).
 pub const BOSS_RISE: f32 = 1.15;
-/// Crown spin rate while open (rad/s).
-const BOSS_SPIN_RATE: f32 = 5.2;
+/// Whole crown turns per open window. Integral turns matter: the split
+/// icosahedron's halves only mesh at multiples of its 72-degree symmetry,
+/// so the crown must seat back exactly where it lifted off.
+const BOSS_SPIN_TURNS_PER_OPEN: f32 = 3.0;
 const BOSS_RING_INTERVAL: f32 = 0.7;
 const BOSS_RING_BOLTS: usize = 12;
 /// Ring bolts fly slower than aimed shots — dodgeable walls, not snipes.
@@ -183,7 +185,9 @@ pub fn boss_crown(age: f32) -> (f32, f32) {
         smooth01(open_t / BOSS_OPEN_RAMP).min(smooth01((BOSS_OPEN_SECONDS - open_t) / BOSS_OPEN_RAMP))
     };
     let cycles = (age / BOSS_CYCLE).floor();
-    let spin = (cycles * BOSS_OPEN_SECONDS + open_t) * BOSS_SPIN_RATE;
+    let spin = (cycles + open_t / BOSS_OPEN_SECONDS)
+        * BOSS_SPIN_TURNS_PER_OPEN
+        * std::f32::consts::TAU;
     (openness, spin)
 }
 
@@ -975,6 +979,17 @@ mod tests {
         let (_, end_of_open) = boss_crown(BOSS_CYCLE - 1e-3);
         let (_, next_cycle) = boss_crown(BOSS_CYCLE + 0.5);
         assert!((next_cycle - end_of_open).abs() < 0.1);
+        // And the seated crown is always in registration: whole turns
+        // only, so the icosahedron pattern meshes when closed.
+        for cycle in 1..5 {
+            let (openness, spin) = boss_crown(cycle as f32 * BOSS_CYCLE + 1.0);
+            assert_eq!(openness, 0.0);
+            let turns = spin / std::f32::consts::TAU;
+            assert!(
+                (turns - turns.round()).abs() < 1e-3,
+                "crown seated {turns} turns — must be whole"
+            );
+        }
     }
 
     #[test]
