@@ -167,6 +167,13 @@ const BOSS_RING_INTERVAL: f32 = 0.7;
 const BOSS_RING_BOLTS: usize = 12;
 /// Ring bolts fly slower than aimed shots — dodgeable walls, not snipes.
 const BOSS_RING_SPEED_SCALE: f32 = 0.62;
+/// Entrance march: gate → arena center, brisk, sealed, not firing.
+const BOSS_ENTRANCE_SPEED: f32 = 2.8;
+/// Close enough to center to take the stage and start the cycle.
+const BOSS_ARRIVE_RADIUS: f32 = 1.5;
+/// Sealed shell during the entrance deflects most damage — otherwise the
+/// scripted march would be a free execution window.
+const BOSS_ENTRANCE_ARMOR: f32 = 0.15;
 
 fn smooth01(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -205,12 +212,24 @@ pub struct Enemy {
     /// Steering hysteresis: which side (±1) this enemy last swerved to
     /// avoid an obstacle; 0 when the way ahead is clear.
     avoid: f32,
+    /// Boss only: age at which it reached the arena center and its attack
+    /// cycle began. `None` while marching in from the gate.
+    boss_cycle_start: Option<f32>,
 }
 
 impl Enemy {
     /// 0 → 1 while materializing at a spawn gate.
     pub fn spawn_progress(&self) -> f32 {
         (self.age / SPAWN_RAMP).min(1.0)
+    }
+
+    /// Boss crown state: `(openness, spin)`. Zero until it has taken the
+    /// stage at the arena center — the entrance march stays sealed.
+    pub fn crown(&self) -> (f32, f32) {
+        match self.boss_cycle_start {
+            Some(start) => boss_crown(self.age - start),
+            None => (0.0, 0.0),
+        }
     }
 
     pub fn center(&self) -> Vec3 {
@@ -467,6 +486,7 @@ impl Game {
             wobble: self.rng.next_f32() * std::f32::consts::TAU,
             fire_cooldown,
             avoid: 0.0,
+            boss_cycle_start: None,
         });
     }
 
@@ -510,9 +530,16 @@ impl Game {
             tracer(&mut self.particles, muzzle, hit_point);
             spark(&mut self.particles, &mut self.rng, hit_point, 5);
             let enemy = &mut self.enemies[i];
-            enemy.hp -= GUN_DAMAGE;
+            // The boss's sealed shell deflects most damage during its
+            // entrance march, and it shrugs off knockback entirely — so
+            // it can't be shoved back into a wall and re-pinned.
+            let entering = enemy.kind == EnemyKind::Boss && enemy.boss_cycle_start.is_none();
+            let armor = if entering { BOSS_ENTRANCE_ARMOR } else { 1.0 };
+            enemy.hp -= GUN_DAMAGE * armor;
             enemy.hit_flash = 1.0;
-            enemy.pos += aim * GUN_KNOCKBACK;
+            if enemy.kind != EnemyKind::Boss {
+                enemy.pos += aim * GUN_KNOCKBACK;
+            }
             if enemy.hp <= 0.0 {
                 self.kill(i);
             }
@@ -584,12 +611,22 @@ impl Game {
                 continue;
             }
             let to_player = player_ground - enemy.pos;
-            let dir = to_player.normalize_or_zero();
+            // The boss enters by marching to the arena center — fighting
+            // it at its spawn gate (pinned on the wall) is not a thing.
+            let mut target = player_ground;
+            let mut speed = enemy.kind.speed();
+            if enemy.kind == EnemyKind::Boss && enemy.boss_cycle_start.is_none() {
+                target = Vec3::ZERO;
+                speed = BOSS_ENTRANCE_SPEED;
+                if enemy.pos.length() < BOSS_ARRIVE_RADIUS {
+                    enemy.boss_cycle_start = Some(enemy.age);
+                }
+            }
+            let dir = (target - enemy.pos).normalize_or_zero();
             // The boss plants itself while its core is open — the attack
             // is a stationary tell; repositioning is the player's window.
-            let mut speed = enemy.kind.speed();
-            if enemy.kind == EnemyKind::Boss {
-                let (openness, spin) = boss_crown(enemy.age);
+            if enemy.kind == EnemyKind::Boss && enemy.boss_cycle_start.is_some() {
+                let (openness, spin) = enemy.crown();
                 if openness > 0.05 {
                     speed = 0.0;
                 }
@@ -950,6 +987,7 @@ mod tests {
                 kind.fire_interval(wave).unwrap_or(f32::INFINITY)
             },
             avoid: 0.0,
+            boss_cycle_start: None,
         }
     }
 
@@ -989,12 +1027,82 @@ mod tests {
     }
 
     #[test]
+    fn boss_marches_to_center_sealed_then_takes_the_stage() {
+        let soup = open_soup();
+        let mut game = Game::new();
+        game.phase = Phase::Fighting;
+        game.wave = 10;
+        // Spawn out at a gate, like the real spawn ring.
+        game.enemies.push(spawned(EnemyKind::Boss, vec3(0.0, 0.0, 22.0), 10));
+
+        // Marching in: sealed, silent, and no cycle has started.
+        for _ in 0..30 {
+            game.update(0.016, EYE, AIM, MUZ, false, &soup);
+        }
+        assert!(game.bolts.is_empty(), "no fire during the entrance");
+        assert_eq!(game.enemies[0].crown().0, 0.0, "shell sealed while entering");
+        let entering = game.enemies[0].pos;
+        assert!(entering.length() < 22.0, "moved toward center");
+        assert!(entering.z < 22.0 && entering.z > 0.0, "heading inward");
+
+        // Run until it reaches the center and takes the stage.
+        for _ in 0..800 {
+            game.update(0.016, EYE, AIM, MUZ, false, &soup);
+            if game.enemies[0].pos.length() < BOSS_ARRIVE_RADIUS {
+                break;
+            }
+        }
+        assert!(
+            game.enemies[0].pos.length() < BOSS_ARRIVE_RADIUS,
+            "reached center (got {:?})",
+            game.enemies[0].pos
+        );
+    }
+
+    #[test]
+    fn boss_shell_deflects_damage_during_entrance() {
+        let mut game = Game::new();
+        game.phase = Phase::Fighting;
+        game.wave = 10;
+        // Directly ahead, still marching in.
+        game.enemies.push(spawned(EnemyKind::Boss, vec3(0.0, 0.0, -8.0), 10));
+        let full = EnemyKind::Boss.max_hp();
+        game.update(0.016, EYE, AIM, MUZ, true, &open_soup());
+        let taken = full - game.enemies[0].hp;
+        assert!(
+            (taken - GUN_DAMAGE * BOSS_ENTRANCE_ARMOR).abs() < 1e-3,
+            "entrance shell should deflect: took {taken}"
+        );
+        assert!(game.enemies[0].boss_cycle_start.is_none(), "still entering");
+    }
+
+    #[test]
+    fn boss_ignores_knockback() {
+        let mut game = Game::new();
+        game.phase = Phase::Fighting;
+        game.wave = 10;
+        // Arrived and closed, so it stalks (not planted) — isolating that
+        // the gun's knockback doesn't shove it back toward a wall.
+        let mut boss = spawned(EnemyKind::Boss, vec3(0.0, 0.0, -8.0), 10);
+        boss.boss_cycle_start = Some(0.0);
+        boss.age = 0.1;
+        game.enemies.push(boss);
+        game.update(0.016, EYE, AIM, MUZ, true, &open_soup());
+        // It steps toward the player (−Z→ +Z a hair), never away from it:
+        // knockback (which points along −Z aim) would push z more negative.
+        assert!(game.enemies[0].pos.z > -8.05, "not shoved backward");
+    }
+
+    #[test]
     fn boss_fires_radial_rings_only_while_open() {
         let soup = open_soup();
         let mut game = Game::new();
         game.phase = Phase::Fighting;
         game.wave = 10;
         let mut boss = spawned(EnemyKind::Boss, vec3(0.0, 0.0, -10.0), 10);
+        // Simulate having taken the stage (the entrance is covered by its
+        // own test); the cycle clock starts from arrival.
+        boss.boss_cycle_start = Some(0.0);
         boss.age = 1.0; // closed window
         game.enemies.push(boss);
         game.update(0.016, EYE, AIM, MUZ, false, &soup);

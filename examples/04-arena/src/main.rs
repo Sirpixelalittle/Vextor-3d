@@ -301,8 +301,8 @@ fn build_dynamic(
         if enemy.kind == EnemyKind::Boss {
             // Two composed models: the base, and the crown riding the
             // attack cycle — rising, spinning, and burning hotter while
-            // the core is exposed.
-            let (openness, spin) = game::boss_crown(enemy.age);
+            // the core is exposed. Sealed during the entrance march.
+            let (openness, spin) = enemy.crown();
             let intensity =
                 (0.25 + 0.75 * progress) * (1.0 + enemy.hit_flash * 2.0 + openness * 0.7);
             let base = Mat4::from_translation(enemy.center())
