@@ -55,6 +55,9 @@ const PACK_PICKUP_RADIUS: f32 = 1.0;
 pub enum EnemyKind {
     Shard,
     Sentinel,
+    /// Wave-10 mini-boss: a split icosahedron whose crown rises and spins
+    /// while bolt rings radiate from the exposed core.
+    Boss,
 }
 
 impl EnemyKind {
@@ -62,6 +65,7 @@ impl EnemyKind {
         match self {
             Self::Shard => 30.0,
             Self::Sentinel => 100.0,
+            Self::Boss => 900.0,
         }
     }
 
@@ -69,6 +73,7 @@ impl EnemyKind {
         match self {
             Self::Shard => 3.4,
             Self::Sentinel => 1.5,
+            Self::Boss => 1.1,
         }
     }
 
@@ -76,6 +81,7 @@ impl EnemyKind {
         match self {
             Self::Shard => 0.55,
             Self::Sentinel => 0.9,
+            Self::Boss => 1.15,
         }
     }
 
@@ -83,6 +89,7 @@ impl EnemyKind {
         match self {
             Self::Shard => 8.0,
             Self::Sentinel => 16.0,
+            Self::Boss => 26.0,
         }
     }
 
@@ -91,6 +98,7 @@ impl EnemyKind {
         match self {
             Self::Shard => 1.1,
             Self::Sentinel => 1.0,
+            Self::Boss => 1.35,
         }
     }
 
@@ -103,6 +111,7 @@ impl EnemyKind {
         match self {
             Self::Shard => vec4(1.0, 0.15, 0.9, 1.0),
             Self::Sentinel => vec4(1.0, 0.55, 0.05, 1.0),
+            Self::Boss => vec4(1.0, 0.22, 0.12, 1.0),
         }
     }
 
@@ -110,6 +119,7 @@ impl EnemyKind {
         match self {
             Self::Shard => 10,
             Self::Sentinel => 30,
+            Self::Boss => 400,
         }
     }
 
@@ -122,7 +132,9 @@ impl EnemyKind {
         match self {
             Self::Sentinel => Some((2.8 - 0.18 * w).max(0.9)),
             Self::Shard if wave >= 3 => Some((4.0 - 0.15 * w).max(1.8)),
-            Self::Shard => None,
+            // The boss fires ring volleys through its own attack cycle,
+            // not the aimed-shot path.
+            Self::Shard | Self::Boss => None,
         }
     }
 }
@@ -134,6 +146,45 @@ fn bolt_speed(wave: u32) -> f32 {
 
 fn bolt_damage(wave: u32) -> f32 {
     (7.0 + 1.3 * wave as f32).min(22.0)
+}
+
+// --- boss attack cycle -----------------------------------------------------
+// Closed: stalks the player. Open: plants, the crown rises and spins, and
+// bolt rings radiate from the exposed core. All state derives from `age`,
+// so simulation and rendering share one source of truth.
+const BOSS_CLOSED_SECONDS: f32 = 3.2;
+const BOSS_OPEN_SECONDS: f32 = 3.6;
+pub const BOSS_CYCLE: f32 = BOSS_CLOSED_SECONDS + BOSS_OPEN_SECONDS;
+/// Crown rise/settle time within the open window.
+const BOSS_OPEN_RAMP: f32 = 0.6;
+/// How high the crown lifts off the base (world units).
+pub const BOSS_RISE: f32 = 1.15;
+/// Crown spin rate while open (rad/s).
+const BOSS_SPIN_RATE: f32 = 5.2;
+const BOSS_RING_INTERVAL: f32 = 0.7;
+const BOSS_RING_BOLTS: usize = 12;
+/// Ring bolts fly slower than aimed shots — dodgeable walls, not snipes.
+const BOSS_RING_SPEED_SCALE: f32 = 0.62;
+
+fn smooth01(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Crown state at `age`: `(openness 0..1, spin angle in radians)`. Spin
+/// only advances while open, and carries across cycles so the crown never
+/// snaps.
+pub fn boss_crown(age: f32) -> (f32, f32) {
+    let t = age.rem_euclid(BOSS_CYCLE);
+    let open_t = (t - BOSS_CLOSED_SECONDS).clamp(0.0, BOSS_OPEN_SECONDS);
+    let openness = if t < BOSS_CLOSED_SECONDS {
+        0.0
+    } else {
+        smooth01(open_t / BOSS_OPEN_RAMP).min(smooth01((BOSS_OPEN_SECONDS - open_t) / BOSS_OPEN_RAMP))
+    };
+    let cycles = (age / BOSS_CYCLE).floor();
+    let spin = (cycles * BOSS_OPEN_SECONDS + open_t) * BOSS_SPIN_RATE;
+    (openness, spin)
 }
 
 #[derive(Debug)]
@@ -219,6 +270,8 @@ pub enum GameEvent {
     GameOver,
     HealthSpawned(Vec3),
     HealthPicked,
+    /// The boss loosed a bolt ring from its open core.
+    BossRing(Vec3),
 }
 
 /// The medkit hovering at the arena center, waiting to be claimed.
@@ -296,6 +349,17 @@ impl Game {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn force_recoil(&mut self, amount: f32) {
         self.recoil = amount.clamp(0.0, 1.0);
+    }
+
+    /// Skip ahead for testing (`--wave N`): clears the field and starts
+    /// the given wave after a short intermission (native only).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn jump_to_wave(&mut self, wave: u32) {
+        self.wave = wave.max(1);
+        self.phase = Phase::Intermission { timer: 1.5 };
+        self.enemies.clear();
+        self.bolts.clear();
+        self.spawn_queue.clear();
     }
 
     /// Spawn the medkit immediately (headless screenshots; native only).
@@ -376,18 +440,28 @@ impl Game {
         }
         self.spawn_timer = SPAWN_INTERVAL;
         let kind = self.spawn_queue.remove(0);
+        // Boss waves past 10 field a tougher boss (bolts already scale).
+        let hp = if kind == EnemyKind::Boss {
+            kind.max_hp() * (1.0 + 0.05 * self.wave.saturating_sub(10) as f32)
+        } else {
+            kind.max_hp()
+        };
         let gate = GATE_ANGLES_DEG[(self.rng.next_f32() * 4.0) as usize % 4];
         let angle = (gate + (self.rng.next_f32() - 0.5) * 24.0).to_radians();
         let pos = vec3(SPAWN_RADIUS * angle.cos(), 0.0, SPAWN_RADIUS * angle.sin());
         // Stagger initial fire so a fresh wave doesn't volley in unison.
-        let fire_cooldown = kind
-            .fire_interval(self.wave)
-            .map_or(f32::INFINITY, |interval| interval * (0.5 + self.rng.next_f32()));
+        // The boss fires through its own cycle: ready from the start.
+        let fire_cooldown = if kind == EnemyKind::Boss {
+            0.0
+        } else {
+            kind.fire_interval(self.wave)
+                .map_or(f32::INFINITY, |interval| interval * (0.5 + self.rng.next_f32()))
+        };
         self.enemies.push(Enemy {
             kind,
             pos,
             yaw: 0.0,
-            hp: kind.max_hp(),
+            hp,
             age: 0.0,
             hit_flash: 0.0,
             wobble: self.rng.next_f32() * std::f32::consts::TAU,
@@ -511,6 +585,37 @@ impl Game {
             }
             let to_player = player_ground - enemy.pos;
             let dir = to_player.normalize_or_zero();
+            // The boss plants itself while its core is open — the attack
+            // is a stationary tell; repositioning is the player's window.
+            let mut speed = enemy.kind.speed();
+            if enemy.kind == EnemyKind::Boss {
+                let (openness, spin) = boss_crown(enemy.age);
+                if openness > 0.05 {
+                    speed = 0.0;
+                }
+                enemy.fire_cooldown -= dt;
+                if openness > 0.85 && enemy.fire_cooldown <= 0.0 {
+                    enemy.fire_cooldown = BOSS_RING_INTERVAL;
+                    // A ring of bolts thrown off the spinning crown: the
+                    // lattice rotates with the spin, launched from the rim
+                    // of the exposed core.
+                    let core = enemy.pos + Vec3::Y * enemy.kind.hover_height();
+                    let tint = enemy.kind.color();
+                    for k in 0..BOSS_RING_BOLTS {
+                        let a = spin + std::f32::consts::TAU * k as f32 / BOSS_RING_BOLTS as f32;
+                        let out = vec3(a.cos(), 0.0, a.sin());
+                        let speed = bolt_speed(wave) * BOSS_RING_SPEED_SCALE;
+                        new_bolts.push(Bolt {
+                            pos: core + out * (enemy.kind.radius() * 0.8),
+                            vel: out * speed,
+                            life: BOLT_RANGE / speed,
+                            color: vec4(tint.x, tint.y, tint.z, 1.7),
+                            damage: bolt_damage(wave),
+                        });
+                    }
+                    self.events.push(GameEvent::BossRing(core));
+                }
+            }
             // Steer around obstacles instead of face-planting into them:
             // whisker raycasts pick a clear heading near the desired one.
             let lookahead = enemy.kind.radius() + enemy.kind.speed() * 0.9 + 0.6;
@@ -529,7 +634,7 @@ impl Game {
                 enemy.pos,
                 enemy.kind.radius(),
                 enemy.kind.capsule_height(),
-                heading * enemy.kind.speed() * dt,
+                heading * speed * dt,
             );
             enemy.pos = vec3(slid.position.x, 0.0, slid.position.z);
             // The face (and the sentinel's eye) keeps tracking the player
@@ -568,7 +673,14 @@ impl Game {
                 self.events.push(GameEvent::PlayerHit);
                 let enemy = &mut self.enemies[i];
                 let away = (enemy.pos - player_ground).normalize_or_zero();
-                enemy.pos += away * 1.4;
+                let slid = slide_capsule(
+                    soup,
+                    enemy.pos,
+                    enemy.kind.radius(),
+                    enemy.kind.capsule_height(),
+                    away * 1.4,
+                );
+                enemy.pos = vec3(slid.position.x, 0.0, slid.position.z);
             }
         }
         self.bolts.extend(new_bolts);
@@ -708,6 +820,10 @@ fn rotate_y(v: Vec3, angle: f32) -> Vec3 {
 
 /// Wave composition: shards scale fast, sentinels join from wave 2.
 pub fn compose_wave(wave: u32) -> Vec<EnemyKind> {
+    // Every 10th wave the arena empties for a lone mini-boss.
+    if wave >= 10 && wave.is_multiple_of(10) {
+        return vec![EnemyKind::Boss];
+    }
     let shards = (2 + wave * 2).min(14);
     let sentinels = wave.saturating_sub(1).min(6);
     let mut queue = Vec::new();
@@ -828,9 +944,90 @@ mod tests {
             age: SPAWN_RAMP + 1.0,
             hit_flash: 0.0,
             wobble: 0.0,
-            fire_cooldown: kind.fire_interval(wave).unwrap_or(f32::INFINITY),
+            fire_cooldown: if kind == EnemyKind::Boss {
+                0.0
+            } else {
+                kind.fire_interval(wave).unwrap_or(f32::INFINITY)
+            },
             avoid: 0.0,
         }
+    }
+
+    #[test]
+    fn every_tenth_wave_is_a_lone_boss() {
+        assert_eq!(compose_wave(10), vec![EnemyKind::Boss]);
+        assert_eq!(compose_wave(20), vec![EnemyKind::Boss]);
+        assert!(!compose_wave(9).contains(&EnemyKind::Boss));
+        assert!(!compose_wave(11).contains(&EnemyKind::Boss));
+    }
+
+    #[test]
+    fn boss_crown_opens_spins_and_settles() {
+        let (closed, _) = boss_crown(1.0);
+        assert_eq!(closed, 0.0, "closed while stalking");
+        let (open, spin_a) = boss_crown(BOSS_CLOSED_SECONDS + 1.5);
+        assert!(open > 0.99, "fully open mid-window");
+        let (_, spin_b) = boss_crown(BOSS_CLOSED_SECONDS + 2.0);
+        assert!(spin_b > spin_a, "crown spins while open");
+        let (reclosed, _) = boss_crown(BOSS_CYCLE + 0.5);
+        assert_eq!(reclosed, 0.0, "closed again next cycle");
+        // Spin carries across cycles — no snap-back.
+        let (_, end_of_open) = boss_crown(BOSS_CYCLE - 1e-3);
+        let (_, next_cycle) = boss_crown(BOSS_CYCLE + 0.5);
+        assert!((next_cycle - end_of_open).abs() < 0.1);
+    }
+
+    #[test]
+    fn boss_fires_radial_rings_only_while_open() {
+        let soup = open_soup();
+        let mut game = Game::new();
+        game.phase = Phase::Fighting;
+        game.wave = 10;
+        let mut boss = spawned(EnemyKind::Boss, vec3(0.0, 0.0, -10.0), 10);
+        boss.age = 1.0; // closed window
+        game.enemies.push(boss);
+        game.update(0.016, EYE, AIM, MUZ, false, &soup);
+        assert!(game.bolts.is_empty(), "no fire while closed");
+        let closed_pos = game.enemies[0].pos;
+        assert_ne!(closed_pos, vec3(0.0, 0.0, -10.0), "stalks while closed");
+
+        // Age into the open window: planted and firing.
+        game.enemies[0].age = BOSS_CLOSED_SECONDS + 1.0;
+        game.enemies[0].fire_cooldown = 0.0;
+        let before = game.enemies[0].pos;
+        game.update(0.016, EYE, AIM, MUZ, false, &soup);
+        assert_eq!(game.enemies[0].pos, before, "planted while open");
+        assert_eq!(game.bolts.len(), 12, "a full ring");
+        assert!(
+            game.events
+                .iter()
+                .any(|e| matches!(e, GameEvent::BossRing(_)))
+        );
+        // Radial: horizontal, uniform speed, directions cancel out.
+        let speed = game.bolts[0].vel.length();
+        let mut sum = Vec3::ZERO;
+        for bolt in &game.bolts {
+            assert!(bolt.vel.y.abs() < 1e-4);
+            assert!((bolt.vel.length() - speed).abs() < 1e-3);
+            sum += bolt.vel / speed;
+        }
+        assert!(sum.length() < 1e-3, "even circle, no aim bias");
+    }
+
+    #[test]
+    fn jump_to_wave_stages_the_requested_wave() {
+        let mut game = Game::new();
+        game.jump_to_wave(10);
+        // Run out the short intermission.
+        for _ in 0..200 {
+            game.update(0.016, EYE, AIM, MUZ, false, &open_soup());
+        }
+        assert_eq!(game.wave, 10);
+        assert!(
+            game.enemies.iter().all(|e| e.kind == EnemyKind::Boss)
+                && (!game.enemies.is_empty() || game.spawn_queue == vec![EnemyKind::Boss]),
+            "wave 10 fields exactly the boss"
+        );
     }
 
     #[test]

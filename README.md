@@ -34,7 +34,10 @@ Survive the waves. Shards swarm, sentinels shoot, and from wave 3 the
 shards shoot too — every wave their fire gets faster and harder. Pillars
 are real cover for both sides. Every 10 kills a medkit spawns at the
 center; kills come slower on later waves, so healing scales down with
-difficulty on its own.
+difficulty on its own. Every 10th wave the arena empties for the
+mini-boss: a split icosahedron whose crown rises and spins while bolt
+rings radiate from its exposed core — planted while open, so the attack
+is also your window. (`--wave 10` jumps straight to it.)
 
 ## How the rendering works
 

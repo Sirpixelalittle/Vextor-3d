@@ -32,6 +32,7 @@ pub enum Sfx {
     GameOver,
     HealthSpawn,
     HealthPickup,
+    BossRing,
 }
 
 pub struct AudioEngine {
@@ -50,6 +51,7 @@ struct Bank {
     game_over: StaticSoundData,
     health_spawn: StaticSoundData,
     health_pickup: StaticSoundData,
+    boss_ring: StaticSoundData,
 }
 
 impl Bank {
@@ -64,6 +66,7 @@ impl Bank {
             Sfx::GameOver => &self.game_over,
             Sfx::HealthSpawn => &self.health_spawn,
             Sfx::HealthPickup => &self.health_pickup,
+            Sfx::BossRing => &self.boss_ring,
         }
     }
 }
@@ -89,6 +92,7 @@ impl AudioEngine {
                 game_over: synth::game_over(),
                 health_spawn: synth::health_spawn(),
                 health_pickup: synth::health_pickup(),
+                boss_ring: synth::boss_ring(),
             },
         })
     }

@@ -33,6 +33,10 @@ const SHARD_PATH: &str = "assets/arena/shard.vec";
 const SENTINEL_PATH: &str = "assets/arena/sentinel.vec";
 #[cfg(not(target_arch = "wasm32"))]
 const HEALTHPACK_PATH: &str = "assets/arena/healthpack.vec";
+#[cfg(not(target_arch = "wasm32"))]
+const BOSS_TOP_PATH: &str = "assets/arena/boss_top.vec";
+#[cfg(not(target_arch = "wasm32"))]
+const BOSS_BOTTOM_PATH: &str = "assets/arena/boss_bottom.vec";
 
 /// Asset root: next to the executable for shipped builds (the packaged
 /// tarball puts `assets/` beside the binary), falling back to the working
@@ -56,6 +60,8 @@ mod embedded {
     pub const SHARD: &[u8] = include_bytes!("../../../assets/arena/shard.vec");
     pub const SENTINEL: &[u8] = include_bytes!("../../../assets/arena/sentinel.vec");
     pub const HEALTHPACK: &[u8] = include_bytes!("../../../assets/arena/healthpack.vec");
+    pub const BOSS_TOP: &[u8] = include_bytes!("../../../assets/arena/boss_top.vec");
+    pub const BOSS_BOTTOM: &[u8] = include_bytes!("../../../assets/arena/boss_bottom.vec");
     pub const PISTOL: &[u8] = include_bytes!("../../../assets/pistol.vec");
 }
 const LINE_WIDTH_PX: f32 = 1.6;
@@ -184,6 +190,8 @@ struct GameModels {
     shard: VecModel,
     sentinel: VecModel,
     healthpack: VecModel,
+    boss_top: VecModel,
+    boss_bottom: VecModel,
 }
 
 impl GameModels {
@@ -191,6 +199,8 @@ impl GameModels {
         match kind {
             EnemyKind::Shard => &self.shard,
             EnemyKind::Sentinel => &self.sentinel,
+            // The boss renders as two composed models, not through here.
+            EnemyKind::Boss => &self.boss_bottom,
         }
     }
 }
@@ -243,10 +253,49 @@ fn build_dynamic(
     for enemy in &game.enemies {
         let progress = enemy.spawn_progress();
         let scale = 0.2 + 0.8 * smoothstep(progress);
+
+        if enemy.kind == EnemyKind::Boss {
+            // Two composed models: the base, and the crown riding the
+            // attack cycle — rising, spinning, and burning hotter while
+            // the core is exposed.
+            let (openness, spin) = game::boss_crown(enemy.age);
+            let intensity =
+                (0.25 + 0.75 * progress) * (1.0 + enemy.hit_flash * 2.0 + openness * 0.7);
+            let base = Mat4::from_translation(enemy.center())
+                * Mat4::from_rotation_y(enemy.yaw)
+                * Mat4::from_scale(Vec3::splat(scale));
+            let crown = base
+                * Mat4::from_translation(Vec3::Y * (openness * game::BOSS_RISE))
+                * Mat4::from_rotation_y(spin);
+            for (model, transform) in
+                [(&models.boss_bottom, base), (&models.boss_top, crown)]
+            {
+                segments.extend(
+                    model
+                        .edge_segments(EdgeKind::Always, intensity)
+                        .into_iter()
+                        .map(|s| Segment {
+                            a: transform.transform_point3(s.a),
+                            b: transform.transform_point3(s.b),
+                            ..s
+                        }),
+                );
+                if progress >= 1.0 {
+                    let start = vertices.len() as u32;
+                    vertices.extend(model.vertices.iter().map(|&v| transform.transform_point3(v)));
+                    indices.extend(model.occluder_indices.iter().map(|&i| i + start));
+                }
+            }
+            if progress < 1.0 {
+                segments.extend(telegraph_ring(enemy.pos, enemy.kind, progress));
+            }
+            continue;
+        }
+
         // Shards tumble freely; sentinels aim their eye at the player.
         let yaw = match enemy.kind {
             EnemyKind::Shard => enemy.age * 1.4 + enemy.wobble,
-            EnemyKind::Sentinel => enemy.yaw,
+            EnemyKind::Sentinel | EnemyKind::Boss => enemy.yaw,
         };
         let transform = Mat4::from_translation(enemy.center())
             * Mat4::from_rotation_y(yaw)
@@ -490,6 +539,9 @@ impl ArenaApp {
             sentinel: VecModel::load(&root.join(SENTINEL_PATH)).context("load sentinel.vec")?,
             healthpack: VecModel::load(&root.join(HEALTHPACK_PATH))
                 .context("load healthpack.vec")?,
+            boss_top: VecModel::load(&root.join(BOSS_TOP_PATH)).context("load boss_top.vec")?,
+            boss_bottom: VecModel::load(&root.join(BOSS_BOTTOM_PATH))
+                .context("load boss_bottom.vec")?,
         };
         Ok((scene, models))
     }
@@ -507,6 +559,8 @@ impl ArenaApp {
             shard: VecModel::load_from(embedded::SHARD).context("shard.vec")?,
             sentinel: VecModel::load_from(embedded::SENTINEL).context("sentinel.vec")?,
             healthpack: VecModel::load_from(embedded::HEALTHPACK).context("healthpack.vec")?,
+            boss_top: VecModel::load_from(embedded::BOSS_TOP).context("boss_top.vec")?,
+            boss_bottom: VecModel::load_from(embedded::BOSS_BOTTOM).context("boss_bottom.vec")?,
         };
         Ok((scene, models))
     }
@@ -570,6 +624,7 @@ impl ArenaApp {
                 GameEvent::GameOver => audio.play(Sfx::GameOver),
                 GameEvent::HealthSpawned(at) => audio.play_at(Sfx::HealthSpawn, at),
                 GameEvent::HealthPicked => audio.play(Sfx::HealthPickup),
+                GameEvent::BossRing(at) => audio.play_at(Sfx::BossRing, at),
             }
         }
     }
@@ -860,7 +915,13 @@ fn main() -> Result<()> {
         "controls: click captures · WASD + Space · LEFT CLICK fires · \
          [R] restart · [C] CRT · Esc releases"
     );
-    vex_engine::run("vector3d — arena", ArenaApp::new()?)
+    let mut app = ArenaApp::new()?;
+    if let Some(wave) = flag_value(&args, "--wave") {
+        let wave: u32 = wave.parse().context("--wave expects a number")?;
+        app.game.jump_to_wave(wave);
+        println!("jumping to wave {wave}");
+    }
+    vex_engine::run("vector3d — arena", app)
 }
 
 /// Web entry: wasm-bindgen invokes `main` when the module loads. The event
@@ -905,6 +966,9 @@ fn screenshot(out: &Path, args: &[String]) -> Result<()> {
     };
 
     let mut app = ArenaApp::new()?;
+    if let Some(wave) = flag_value(args, "--wave") {
+        app.game.jump_to_wave(wave.parse().context("--wave expects a number")?);
+    }
     if let Some(pos) = flag_value(args, "--pos") {
         app.player.pos = parse_vec3(&pos)?;
     }

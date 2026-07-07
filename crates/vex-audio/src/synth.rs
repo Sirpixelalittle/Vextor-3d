@@ -196,6 +196,15 @@ pub fn health_pickup() -> StaticSoundData {
     to_sound(append(out, sparkle))
 }
 
+pub fn boss_ring() -> StaticSoundData {
+    // A heavy rotating discharge: paired detuned saws diving an octave
+    // with a grinding noise bed — fatter and angrier than a single bolt.
+    let a = sweep_exp(0.34, 420.0, 88.0, 6.5, 0.34, saw);
+    let b = sweep_exp(0.34, 436.0, 96.0, 6.5, 0.26, saw);
+    let grind = burst(0.22, 11.0, 0.22);
+    to_sound(mix(mix(a, &b), &grind))
+}
+
 pub fn game_over() -> StaticSoundData {
     // Three falling notes into the void.
     let mut out = Vec::new();
@@ -230,6 +239,7 @@ mod tests {
             ("game_over", game_over()),
             ("health_spawn", health_spawn()),
             ("health_pickup", health_pickup()),
+            ("boss_ring", boss_ring()),
         ] {
             assert!(!sound.frames.is_empty(), "{name} is empty");
             let p = peak(&sound);
