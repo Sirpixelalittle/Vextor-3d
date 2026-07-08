@@ -134,6 +134,16 @@ Every example has a headless `--screenshot` mode (deterministic `--demo`
 simulation in the arena) — the project was verified throughout by
 rendering frames and looking at them.
 
+## Documentation
+
+Proper engine docs live in [`docs/`](docs/README.md): [getting
+started](docs/getting-started.md), [architecture](docs/architecture.md),
+the [rendering pipeline](docs/rendering.md), the [file
+formats](docs/formats.md) (`.vec` / scene / anim specs), [building a
+game](docs/building-a-game.md), and [web builds](docs/web.md). The
+examples double as the tutorials; `cargo doc --workspace --no-deps
+--open` gives the API reference.
+
 ## Building
 
 Native needs Rust (edition 2024) and Vulkan-capable drivers:
