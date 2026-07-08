@@ -31,6 +31,19 @@ pub trait App {
         depth: &wgpu::TextureView,
         viewport: Vec2,
     );
+
+    /// Should a left click grab the mouse for look? Menus return false so
+    /// clicks reach the app as ordinary pointer input instead.
+    fn wants_capture(&self) -> bool {
+        true
+    }
+
+    /// Polled once per frame after `update`; return true to close the app
+    /// (a menu's Quit button). No effect on the web — there's no window to
+    /// close, so don't offer the button there.
+    fn should_quit(&self) -> bool {
+        false
+    }
 }
 
 /// Open a window and run the app until close. Left click captures the mouse
@@ -275,12 +288,17 @@ impl<A: App> ApplicationHandler for Shell<A> {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
             WindowEvent::Focused(false) => self.set_capture(false),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.input.cursor = Vec2::new(position.x as f32, position.y as f32);
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 // The capturing click is consumed; everything after that
-                // is game input (attacks etc.).
+                // is game input (attacks etc.). Apps that are showing a
+                // menu decline the grab and get the click as input.
                 if button == MouseButton::Left
                     && state == ElementState::Pressed
                     && !self.input.captured
+                    && self.app.wants_capture()
                 {
                     self.set_capture(true);
                 } else {
@@ -302,7 +320,12 @@ impl<A: App> ApplicationHandler for Shell<A> {
                 };
                 self.input.add_scroll(lines);
             }
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => {
+                self.redraw();
+                if self.app.should_quit() {
+                    event_loop.exit();
+                }
+            }
             _ => {}
         }
     }

@@ -56,6 +56,7 @@ cargo run -p viewer -- assets/suzanne/suzanne.vec \
 cargo run -p arena -- --wave 10                    # start at the boss wave
 cargo run -p arena -- --screenshot out.png --size 1280x720 \
     --demo 8.0                                     # simulate 8s first
+cargo run -p arena -- --screenshot out.png --menu [--options]  # start screen
 ```
 
 The viewer also accepts `.gltf`/`.glb` directly (converted in-process) and

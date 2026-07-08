@@ -6,12 +6,15 @@
 //! Headless:    cargo run -p arena -- --screenshot out.png [--size WxH]
 //!                  [--demo SECONDS] [--recoil 0..1] [--pos x,y,z]
 //!                  [--yaw DEG] [--pitch DEG] [--wave N] [--pack AGE]
+//!                  [--menu [--options]]
 //!
-//! Controls: click captures · WASD moves · SPACE/SHIFT dashes (10 s
-//!           cooldown) · left click fires · \[R\] restarts · \[C\] CRT ·
-//!           Esc releases.
+//! Boots to a start screen (point and click: Play / Options with a mouse
+//! sensitivity slider / Quit). In the arena: WASD moves · SPACE/SHIFT
+//! dashes (10 s cooldown) · left click fires · \[R\] restarts · \[C\] CRT ·
+//! Esc releases the mouse.
 
 mod game;
+mod menu;
 mod sounds;
 
 use anyhow::{Context, Result};
@@ -446,6 +449,97 @@ fn ring_segments(center: Vec3, radius: f32, color: Vec4) -> Vec<Segment> {
 
 // ------------------------------------------------------------------- hud --
 
+/// The start screen in HUD space: title block, buttons that swell and
+/// brighten under the cursor, the options slider, and control hints.
+/// Geometry comes from the same [`menu::layout`] the hit tests use.
+fn menu_segments(state: &menu::Menu, viewport: Vec2) -> Vec<Segment> {
+    let green = |w: f32| Vec4::new(0.62, 1.0, 0.68, w);
+    let mut out = Vec::new();
+
+    // Title block in the upper third.
+    let title_px = (viewport.x * 0.075).clamp(40.0, 88.0);
+    let title_w = font::text_width(menu::TITLE, title_px);
+    out.extend(font::text_segments(
+        menu::TITLE,
+        vec2((viewport.x - title_w) * 0.5, viewport.y * 0.72),
+        title_px,
+        green(1.55),
+    ));
+    let sub_px = title_px * 0.36;
+    let sub_w = font::text_width(menu::SUBTITLE, sub_px);
+    out.extend(font::text_segments(
+        menu::SUBTITLE,
+        vec2((viewport.x - sub_w) * 0.5, viewport.y * 0.72 - sub_px * 2.1),
+        sub_px,
+        Vec4::new(1.0, 0.32, 0.22, 1.15),
+    ));
+
+    for (i, item) in menu::layout(state.page, viewport).iter().enumerate() {
+        let hover = state.hover[i];
+        // Hovered items grow around their center and brighten.
+        let px = item.px * (1.0 + menu::HOVER_GROW * hover);
+        let width = font::text_width(item.label, px);
+        let origin = vec2(
+            (viewport.x - width) * 0.5,
+            item.origin.y - (px - item.px) * 0.5,
+        );
+        out.extend(font::text_segments(
+            item.label,
+            origin,
+            px,
+            green(0.7 + 1.3 * hover),
+        ));
+
+        if item.kind == menu::ItemKind::Slider {
+            let (left, right) = menu::slider_track(item);
+            let handle_x = left.x + (right.x - left.x) * state.sensitivity;
+            let y = left.y;
+            // Filled portion hot, remainder dim, diamond handle.
+            out.push(Segment::new(
+                vec3(left.x, y, 0.0),
+                vec3(handle_x, y, 0.0),
+                green(1.3),
+            ));
+            out.push(Segment::new(
+                vec3(handle_x, y, 0.0),
+                vec3(right.x, y, 0.0),
+                green(0.35),
+            ));
+            const HANDLE: f32 = 9.0;
+            let corners = [
+                vec3(handle_x, y + HANDLE, 0.0),
+                vec3(handle_x + HANDLE, y, 0.0),
+                vec3(handle_x, y - HANDLE, 0.0),
+                vec3(handle_x - HANDLE, y, 0.0),
+            ];
+            for k in 0..4 {
+                out.push(Segment::new(corners[k], corners[(k + 1) % 4], green(1.6)));
+            }
+            // Live multiplier readout beside the track.
+            let readout =
+                format!("{:.0}%", menu::sensitivity_scale(state.sensitivity) * 100.0);
+            out.extend(font::text_segments(
+                &readout,
+                vec2(right.x + 26.0, y - 9.0),
+                18.0,
+                green(0.9),
+            ));
+        }
+    }
+
+    // Control hints, small and dim at the bottom.
+    let hint = "WASD MOVE - SPACE DASH - LMB FIRE";
+    let hint_px = 13.0;
+    let hint_w = font::text_width(hint, hint_px);
+    out.extend(font::text_segments(
+        hint,
+        vec2((viewport.x - hint_w) * 0.5, 34.0),
+        hint_px,
+        green(0.5),
+    ));
+    out
+}
+
 fn hud_segments(viewport: Vec2, game: &Game, dash_ready: f32) -> Vec<Segment> {
     let red = Vec4::new(phosphor::RED.x, phosphor::RED.y, phosphor::RED.z, 0.95);
     let lime = Vec4::new(phosphor::LIME.x, phosphor::LIME.y, phosphor::LIME.z, 0.9);
@@ -591,6 +685,18 @@ struct Frame<'a> {
     viewport: Vec2,
 }
 
+/// Which top-level view the app is showing. The menu owns the mouse as a
+/// pointer (the shell doesn't capture clicks while it's up); gameplay owns
+/// it as look input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Menu,
+    Playing,
+}
+
+/// Backdrop camera drift while the menu is up (radians/second).
+const MENU_ORBIT_SPEED: f32 = 0.12;
+
 struct ArenaApp {
     scene: BakedScene,
     soup: TriangleSoup,
@@ -602,6 +708,15 @@ struct ArenaApp {
     world_uploaded: bool,
     time: f32,
     post_settings: PostSettings,
+    screen: Screen,
+    menu: menu::Menu,
+    menu_angle: f32,
+    quit: bool,
+    /// Authored default mouse sensitivity; the options slider scales it.
+    sens_base: f32,
+    /// Surface size from the last render — update() needs it for menu
+    /// hit-testing before this frame's render runs.
+    last_viewport: Vec2,
     /// Created on the first captured click — that user gesture is exactly
     /// what browser autoplay policies require before audio may start.
     audio: Option<AudioEngine>,
@@ -680,6 +795,7 @@ impl ArenaApp {
         );
         Ok(Self {
             post_settings: scene.post,
+            sens_base: player.sensitivity,
             scene,
             soup,
             player,
@@ -692,6 +808,11 @@ impl ArenaApp {
             audio: None,
             audio_failed: false,
             sounds: Sounds::synth(),
+            screen: Screen::Menu,
+            menu: menu::Menu::new(),
+            menu_angle: 0.0,
+            quit: false,
+            last_viewport: vec2(1280.0, 720.0),
         })
     }
 
@@ -753,7 +874,6 @@ impl ArenaApp {
         let Some(renderers) = self.renderers.as_mut() else {
             return;
         };
-        let aspect = frame.viewport.x / frame.viewport.y;
         renderers.post.ensure_size(
             &frame.gpu.device,
             frame.viewport.x as u32,
@@ -775,6 +895,121 @@ impl ArenaApp {
             self.world_uploaded = true;
         }
 
+        match self.screen {
+            Screen::Menu => self.draw_menu(frame),
+            Screen::Playing => self.draw_game(frame),
+        }
+    }
+
+    /// The start screen: the empty arena drifting by under big vector
+    /// type. Same world passes and post chain as gameplay — the menu is
+    /// just different segments in the HUD layer.
+    fn draw_menu(&mut self, frame: &Frame) {
+        let Some(renderers) = self.renderers.as_mut() else {
+            return;
+        };
+        let aspect = frame.viewport.x / frame.viewport.y;
+        // Tilted slightly upward so the busy center-floor pattern sinks
+        // to the bottom of the frame; the labels sit over the calmer
+        // mid-wall lines instead.
+        let eye = vec3(
+            self.menu_angle.cos() * 15.5,
+            8.0,
+            self.menu_angle.sin() * 15.5,
+        );
+        let target = vec3(0.0, 7.0, 0.0);
+        let view =
+            glam::camera::rh::view::look_to_mat4(eye, (target - eye).normalize(), Vec3::Y);
+        let proj =
+            glam::camera::rh::proj::directx::perspective(60f32.to_radians(), aspect, 0.05, 300.0);
+        let view_proj = proj * view;
+
+        let frustum = Frustum::from_view_proj(view_proj);
+        let mut segment_ranges = Vec::new();
+        let mut occluder_ranges = Vec::new();
+        for instance in &self.scene.instances {
+            if frustum.intersects_aabb(instance.aabb_min, instance.aabb_max) {
+                segment_ranges.push(instance.segments.clone());
+                occluder_ranges.push(instance.occluder_indices.clone());
+            }
+        }
+
+        let world_uniform = CameraUniform::new(
+            view_proj,
+            frame.viewport,
+            LINE_WIDTH_PX,
+            eye,
+            self.scene.fog_density,
+            self.time,
+            self.post_settings.glow,
+        );
+        renderers
+            .world_camera
+            .update(&frame.gpu.queue, &world_uniform);
+
+        renderers.hud_lines.set_segments(
+            &frame.gpu.device,
+            &frame.gpu.queue,
+            &menu_segments(&self.menu, frame.viewport),
+        );
+        let hud_uniform = CameraUniform::new(
+            glam::camera::rh::proj::directx::orthographic(
+                0.0,
+                frame.viewport.x,
+                0.0,
+                frame.viewport.y,
+                -1.0,
+                1.0,
+            ),
+            frame.viewport,
+            HUD_LINE_WIDTH_PX,
+            Vec3::ZERO,
+            0.0,
+            self.time,
+            self.post_settings.glow,
+        );
+        renderers.hud_camera.update(&frame.gpu.queue, &hud_uniform);
+
+        let hdr = renderers.post.hdr_view();
+        let mut encoder = frame
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        renderers.world_occluders.render_ranges(
+            &mut encoder,
+            frame.depth,
+            &renderers.world_camera,
+            true,
+            &occluder_ranges,
+        );
+        renderers.world_lines.render_ranges(
+            &mut encoder,
+            hdr,
+            frame.depth,
+            &renderers.world_camera,
+            true,
+            false,
+            &segment_ranges,
+        );
+        renderers.hud_lines.render(
+            &mut encoder,
+            hdr,
+            frame.depth,
+            &renderers.hud_camera,
+            false,
+            true,
+        );
+        renderers
+            .post
+            .run(&frame.gpu.queue, &mut encoder, frame.color, &self.post_settings);
+        frame.gpu.queue.submit([encoder.finish()]);
+    }
+
+    fn draw_game(&mut self, frame: &Frame) {
+        let Some(renderers) = self.renderers.as_mut() else {
+            return;
+        };
+        let aspect = frame.viewport.x / frame.viewport.y;
         let amp = self.game.damage_flash * 0.05;
         let eye = self.player.eye()
             + vec3(
@@ -957,6 +1192,41 @@ impl App for ArenaApp {
     }
 
     fn update(&mut self, dt: f32, input: &Input) {
+        match self.screen {
+            Screen::Menu => self.update_menu(dt, input),
+            Screen::Playing => self.update_game(dt, input),
+        }
+    }
+
+    fn wants_capture(&self) -> bool {
+        matches!(self.screen, Screen::Playing)
+    }
+
+    fn should_quit(&self) -> bool {
+        self.quit
+    }
+
+    fn render(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        viewport: Vec2,
+    ) {
+        let _ = encoder; // this app submits its own multi-camera encoder
+        self.last_viewport = viewport;
+        self.draw(&Frame {
+            gpu,
+            color,
+            depth,
+            viewport,
+        });
+    }
+}
+
+impl ArenaApp {
+    fn update_game(&mut self, dt: f32, input: &Input) {
         self.time += dt;
         if input.is_just_pressed(KeyCode::KeyC) {
             self.post_settings.crt = if self.post_settings.crt > 0.0 { 0.0 } else { 1.0 };
@@ -990,21 +1260,23 @@ impl App for ArenaApp {
         self.play_events(events);
     }
 
-    fn render(
-        &mut self,
-        gpu: &Gpu,
-        encoder: &mut wgpu::CommandEncoder,
-        color: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
-        viewport: Vec2,
-    ) {
-        let _ = encoder; // this app submits its own multi-camera encoder
-        self.draw(&Frame {
-            gpu,
-            color,
-            depth,
-            viewport,
-        });
+    fn update_menu(&mut self, dt: f32, input: &Input) {
+        self.time += dt;
+        self.menu_angle += dt * MENU_ORBIT_SPEED;
+        // Window cursor is y-down; the menu lives in HUD space (y-up).
+        let cursor = input.cursor_position();
+        let cursor = vec2(cursor.x, self.last_viewport.y - cursor.y);
+        let click = input.is_mouse_just_pressed(MouseButton::Left);
+        let held = input.is_mouse_down(MouseButton::Left);
+        match self.menu.update(dt, self.last_viewport, cursor, click, held) {
+            menu::Action::Play => self.screen = Screen::Playing,
+            menu::Action::Quit => self.quit = true,
+            menu::Action::None => {}
+        }
+        // The slider applies live, so the new aim feel is there the moment
+        // you step into the arena.
+        self.player.sensitivity =
+            self.sens_base * menu::sensitivity_scale(self.menu.sensitivity);
     }
 }
 
@@ -1072,6 +1344,17 @@ fn screenshot(out: &Path, args: &[String]) -> Result<()> {
     };
 
     let mut app = ArenaApp::new()?;
+    // Screenshots default to gameplay so existing flags keep working;
+    // `--menu` (optionally with `--options`) shoots the start screen,
+    // first item hovered so the grow/brighten styling is visible.
+    if args.iter().any(|a| a == "--menu") {
+        app.menu.hover[0] = 1.0;
+        if args.iter().any(|a| a == "--options") {
+            app.menu.page = menu::Page::Options;
+        }
+    } else {
+        app.screen = Screen::Playing;
+    }
     if let Some(wave) = flag_value(args, "--wave") {
         app.game.jump_to_wave(wave.parse().context("--wave expects a number")?);
     }

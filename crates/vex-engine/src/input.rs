@@ -14,6 +14,7 @@ pub struct Input {
     pub(crate) mouse_delta: Vec2,
     pub(crate) scroll: f32,
     pub(crate) captured: bool,
+    pub(crate) cursor: Vec2,
 }
 
 impl Input {
@@ -45,6 +46,14 @@ impl Input {
     /// Scroll wheel movement since the last frame, in lines (up = positive).
     pub fn scroll_delta(&self) -> f32 {
         self.scroll
+    }
+
+    /// Cursor position in physical window pixels, y down from the top-left
+    /// (for menus and other uncaptured pointing). Frozen while the cursor
+    /// is captured for mouse-look — use [`mouse_delta`](Self::mouse_delta)
+    /// there instead.
+    pub fn cursor_position(&self) -> Vec2 {
+        self.cursor
     }
 
     /// True while the cursor is grabbed for mouse-look.
