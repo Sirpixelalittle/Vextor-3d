@@ -91,11 +91,21 @@ impl VecModel {
     /// Materialize edges of one kind as colored segments (styles applied).
     /// `intensity_scale` multiplies each edge's stored intensity.
     pub fn edge_segments(&self, kind: EdgeKind, intensity_scale: f32) -> Vec<Segment> {
-        self.edges
-            .iter()
-            .filter(|edge| edge.kind == kind)
-            .map(|edge| self.materialize(edge, intensity_scale))
-            .collect()
+        let mut segments = Vec::new();
+        self.edge_segments_into(kind, intensity_scale, &mut segments);
+        segments
+    }
+
+    /// Append materialized edges of one kind to `out`.
+    pub fn edge_segments_into(
+        &self,
+        kind: EdgeKind,
+        intensity_scale: f32,
+        out: &mut Vec<Segment>,
+    ) {
+        for edge in self.edges.iter().filter(|edge| edge.kind == kind) {
+            out.push(self.materialize(edge, intensity_scale));
+        }
     }
 
     fn materialize(&self, edge: &VecEdge, intensity_scale: f32) -> Segment {

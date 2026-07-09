@@ -70,15 +70,28 @@ fn strokes(c: char) -> Strokes {
 /// baseline starting at `origin` (pixels), glyphs `px_height` tall.
 /// Lowercase is rendered as uppercase.
 pub fn text_segments(text: &str, origin: Vec2, px_height: f32, color: Vec4) -> Vec<Segment> {
-    let scale = px_height / GRID_HEIGHT;
     let mut segments = Vec::new();
+    text_segments_into(text, origin, px_height, color, &mut segments);
+    segments
+}
+
+/// Append a screen-space stroke font string to `out` without allocating a
+/// temporary segment vector.
+pub fn text_segments_into(
+    text: &str,
+    origin: Vec2,
+    px_height: f32,
+    color: Vec4,
+    out: &mut Vec<Segment>,
+) {
+    let scale = px_height / GRID_HEIGHT;
     let mut pen_x = origin.x;
     for c in text.chars() {
         for polyline in strokes(c.to_ascii_uppercase()) {
             for pair in polyline.windows(2) {
                 let (x0, y0) = pair[0];
                 let (x1, y1) = pair[1];
-                segments.push(Segment::new(
+                out.push(Segment::new(
                     vec3(pen_x + f32::from(x0) * scale, origin.y + f32::from(y0) * scale, 0.0),
                     vec3(pen_x + f32::from(x1) * scale, origin.y + f32::from(y1) * scale, 0.0),
                     color,
@@ -88,12 +101,11 @@ pub fn text_segments(text: &str, origin: Vec2, px_height: f32, color: Vec4) -> V
             if polyline.len() == 1 {
                 let (x, y) = polyline[0];
                 let p = vec3(pen_x + f32::from(x) * scale, origin.y + f32::from(y) * scale, 0.0);
-                segments.push(Segment::new(p, p, color));
+                out.push(Segment::new(p, p, color));
             }
         }
         pen_x += ADVANCE * scale;
     }
-    segments
 }
 
 /// Width in pixels that `text` will occupy at `px_height`.

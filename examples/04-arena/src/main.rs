@@ -132,35 +132,38 @@ impl Weapon {
             * self.fit
     }
 
-    fn frame_geometry(
+    fn frame_geometry_into(
         &self,
         bob_phase: f32,
         recoil: f32,
-    ) -> (Vec<Segment>, Vec<Vec3>, Vec<u32>) {
+        segments: &mut Vec<Segment>,
+        vertices: &mut Vec<Vec3>,
+        indices: &mut Vec<u32>,
+    ) {
         let placement = self.placement(bob_phase, recoil);
-        let mut segments: Vec<Segment> = self
-            .model
-            .edge_segments(EdgeKind::Always, WEAPON_GLOW)
-            .into_iter()
-            .map(|s| Segment {
-                a: placement.transform_point3(s.a),
-                b: placement.transform_point3(s.b),
-                ..s
-            })
-            .collect();
+        segments.clear();
+        vertices.clear();
+        indices.clear();
+        let start = segments.len();
+        self.model
+            .edge_segments_into(EdgeKind::Always, WEAPON_GLOW, segments);
+        for segment in &mut segments[start..] {
+            segment.a = placement.transform_point3(segment.a);
+            segment.b = placement.transform_point3(segment.b);
+        }
         self.model.silhouette_segments_into(
             placement,
             Vec3::ZERO,
             WEAPON_GLOW,
-            &mut segments,
+            segments,
         );
-        let vertices: Vec<Vec3> = self
-            .model
-            .vertices
-            .iter()
-            .map(|&v| placement.transform_point3(v))
-            .collect();
-        (segments, vertices, self.model.occluder_indices.clone())
+        vertices.extend(
+            self.model
+                .vertices
+                .iter()
+                .map(|&v| placement.transform_point3(v)),
+        );
+        indices.extend_from_slice(&self.model.occluder_indices);
     }
 }
 
@@ -175,11 +178,11 @@ const MUZZLE: Vec3 = vec3(0.16, -0.10, -1.02);
 
 /// A brief radial star at the barrel tip on the frames right after firing.
 /// Drawn with the weapon camera, so it stays glued to the gun.
-fn muzzle_flash(recoil: f32) -> Vec<Segment> {
+fn append_muzzle_flash(recoil: f32, out: &mut Vec<Segment>) {
     // Only the first ~third of the recoil decay (a couple of frames).
     let k = ((recoil - 0.65) / 0.35).clamp(0.0, 1.0);
     if k <= 0.0 {
-        return Vec::new();
+        return;
     }
     let len = 0.05 + 0.08 * k;
     // White-hot and strongly overbright: it lives for a couple of frames,
@@ -189,21 +192,18 @@ fn muzzle_flash(recoil: f32) -> Vec<Segment> {
     // glued to the barrel as the gun jumps.
     let origin = MUZZLE + vec3(0.0, 0.02 * recoil, 0.10 * recoil);
     const SPOKES: usize = 8;
-    let mut out: Vec<Segment> = (0..SPOKES)
-        .map(|i| {
-            let a = std::f32::consts::TAU * i as f32 / SPOKES as f32;
-            // Forward-biased so it reads as blowing out of the barrel.
-            let dir = vec3(a.cos() * len, a.sin() * len, -len * 0.5);
-            Segment::new(origin, origin + dir, color)
-        })
-        .collect();
+    for i in 0..SPOKES {
+        let a = std::f32::consts::TAU * i as f32 / SPOKES as f32;
+        // Forward-biased so it reads as blowing out of the barrel.
+        let dir = vec3(a.cos() * len, a.sin() * len, -len * 0.5);
+        out.push(Segment::new(origin, origin + dir, color));
+    }
     // A hot jet straight out of the bore.
     out.push(Segment::new(
         origin,
         origin + vec3(0.0, 0.0, -len * 2.2),
         Vec4::new(1.0, 0.98, 0.85, 3.2 + 1.6 * k),
     ));
-    out
 }
 
 // --------------------------------------------------------------- enemies --
@@ -233,7 +233,7 @@ impl GameModels {
 /// A streak-along-velocity vanishes to a dot exactly when a bolt flies
 /// at your face; the dart's ring stays visible head-on (Tempest drew
 /// its shots as little shapes for the same reason).
-fn bolt_dart(bolt: &game::Bolt) -> impl Iterator<Item = Segment> {
+fn append_bolt_dart(bolt: &game::Bolt, out: &mut Vec<Segment>) {
     const HALF_LEN: f32 = 0.30;
     const GIRTH: f32 = 0.075;
     const TRAIL: f32 = 0.5;
@@ -258,26 +258,27 @@ fn bolt_dart(bolt: &game::Bolt) -> impl Iterator<Item = Segment> {
     ];
     let color = bolt.color;
     let trail_color = Vec4::new(color.x, color.y, color.z, color.w * 0.45);
-    let mut out = Vec::with_capacity(13);
     for i in 0..4 {
         out.push(Segment::new(nose, ring[i], color));
         out.push(Segment::new(tail, ring[i], color));
         out.push(Segment::new(ring[i], ring[(i + 1) % 4], color));
     }
     out.push(Segment::new(tail, tail - fwd * TRAIL, trail_color));
-    out.into_iter()
 }
 
 /// Enemies, spawn telegraphs, pickups and particles as this frame's
 /// dynamic geometry (world-space segments + occluder soup).
-fn build_dynamic(
+fn build_dynamic_into(
     models: &GameModels,
     game: &Game,
     time: f32,
-) -> (Vec<Segment>, Vec<Vec3>, Vec<u32>) {
-    let mut segments = Vec::new();
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
+    segments: &mut Vec<Segment>,
+    vertices: &mut Vec<Vec3>,
+    indices: &mut Vec<u32>,
+) {
+    segments.clear();
+    vertices.clear();
+    indices.clear();
 
     // Boss bounties: a solid spinning double-chevron — the dash glyph in
     // 3D (its faces occlude, so it reads solid, not wireframe) — bobbing
@@ -287,26 +288,13 @@ fn build_dynamic(
         let transform = Mat4::from_translation(drop.center())
             * Mat4::from_rotation_y(drop.age * 1.4)
             * Mat4::from_scale(Vec3::splat(pop * 0.55));
-        segments.extend(
-            models
-                .powerup
-                .edge_segments(EdgeKind::Always, 0.85 + 0.25 * (drop.age * 3.0).sin())
-                .into_iter()
-                .map(|s| Segment {
-                    a: transform.transform_point3(s.a),
-                    b: transform.transform_point3(s.b),
-                    ..s
-                }),
+        append_model_edges(
+            &models.powerup,
+            transform,
+            0.85 + 0.25 * (drop.age * 3.0).sin(),
+            segments,
         );
-        let base = vertices.len() as u32;
-        vertices.extend(
-            models
-                .powerup
-                .vertices
-                .iter()
-                .map(|&v| transform.transform_point3(v)),
-        );
-        indices.extend(models.powerup.occluder_indices.iter().map(|&i| i + base));
+        append_model_occluder(&models.powerup, transform, vertices, indices);
         // Claim ring on the floor, breathing with the bob.
         let ring_r = 0.62 + (drop.age * 2.0).sin() * 0.05;
         let ring_color = Vec4::new(0.35, 0.95, 1.0, 0.55);
@@ -330,32 +318,20 @@ fn build_dynamic(
         let transform = Mat4::from_translation(pack.center())
             * Mat4::from_rotation_y(pack.age * 0.9)
             * Mat4::from_scale(Vec3::splat(pop));
-        segments.extend(
-            models
-                .healthpack
-                .edge_segments(EdgeKind::Always, 0.7 + 0.3 * (pack.age * 2.2).sin())
-                .into_iter()
-                .map(|s| Segment {
-                    a: transform.transform_point3(s.a),
-                    b: transform.transform_point3(s.b),
-                    ..s
-                }),
+        append_model_edges(
+            &models.healthpack,
+            transform,
+            0.7 + 0.3 * (pack.age * 2.2).sin(),
+            segments,
         );
-        let base = vertices.len() as u32;
-        vertices.extend(
-            models
-                .healthpack
-                .vertices
-                .iter()
-                .map(|&v| transform.transform_point3(v)),
-        );
-        indices.extend(models.healthpack.occluder_indices.iter().map(|&i| i + base));
+        append_model_occluder(&models.healthpack, transform, vertices, indices);
         let ring_radius = 0.9 + (pack.age * 2.0).sin() * 0.12;
-        segments.extend(ring_segments(
+        append_ring_segments(
             pack.pos + Vec3::Y * 0.02,
             ring_radius,
             Vec4::new(1.0, 0.10, 0.08, 0.5 * pop),
-        ));
+            segments,
+        );
     }
 
     for enemy in &game.enemies {
@@ -378,24 +354,13 @@ fn build_dynamic(
             for (model, transform) in
                 [(&models.boss_bottom, base), (&models.boss_top, crown)]
             {
-                segments.extend(
-                    model
-                        .edge_segments(EdgeKind::Always, intensity)
-                        .into_iter()
-                        .map(|s| Segment {
-                            a: transform.transform_point3(s.a),
-                            b: transform.transform_point3(s.b),
-                            ..s
-                        }),
-                );
+                append_model_edges(model, transform, intensity, segments);
                 if progress >= 1.0 {
-                    let start = vertices.len() as u32;
-                    vertices.extend(model.vertices.iter().map(|&v| transform.transform_point3(v)));
-                    indices.extend(model.occluder_indices.iter().map(|&i| i + start));
+                    append_model_occluder(model, transform, vertices, indices);
                 }
             }
             if progress < 1.0 {
-                segments.extend(telegraph_ring(enemy.pos, enemy.kind, progress));
+                append_telegraph_ring(enemy.pos, enemy.kind, progress, segments);
             }
             continue;
         }
@@ -410,31 +375,18 @@ fn build_dynamic(
             * Mat4::from_scale(Vec3::splat(scale));
         let intensity = (0.25 + 0.75 * progress) * (1.0 + enemy.hit_flash * 2.0);
         let model = models.get(enemy.kind);
-        segments.extend(model.edge_segments(EdgeKind::Always, intensity).into_iter().map(
-            |s| Segment {
-                a: transform.transform_point3(s.a),
-                b: transform.transform_point3(s.b),
-                ..s
-            },
-        ));
+        append_model_edges(model, transform, intensity, segments);
         if progress >= 1.0 {
-            let base = vertices.len() as u32;
-            vertices.extend(
-                model
-                    .vertices
-                    .iter()
-                    .map(|&v| transform.transform_point3(v)),
-            );
-            indices.extend(model.occluder_indices.iter().map(|&i| i + base));
+            append_model_occluder(model, transform, vertices, indices);
         } else {
             // Spawn telegraph: a ring blooming on the floor.
-            segments.extend(telegraph_ring(enemy.pos, enemy.kind, progress));
+            append_telegraph_ring(enemy.pos, enemy.kind, progress, segments);
         }
     }
 
     // Enemy bolts: hot glowing darts in their shooter's color.
     for bolt in &game.bolts {
-        segments.extend(bolt_dart(bolt));
+        append_bolt_dart(bolt, segments);
     }
 
     // Player slugs: tiny white-hot streaks, a fraction of a dart's size
@@ -467,35 +419,58 @@ fn build_dynamic(
     // A faint pulse ring around the player during game over, for drama.
     if matches!(game.phase, Phase::GameOver) {
         let pulse = 2.0 + (time * 1.5).sin() * 0.3;
-        segments.extend(ring_segments(
+        append_ring_segments(
             Vec3::ZERO + vec3(0.0, 0.02, 0.0),
             pulse,
             Vec4::new(1.0, 0.08, 0.05, 0.5),
-        ));
+            segments,
+        );
     }
 
-    (segments, vertices, indices)
 }
 
-fn telegraph_ring(at: Vec3, kind: EnemyKind, progress: f32) -> Vec<Segment> {
+fn append_model_edges(
+    model: &VecModel,
+    transform: Mat4,
+    intensity: f32,
+    out: &mut Vec<Segment>,
+) {
+    let start = out.len();
+    model.edge_segments_into(EdgeKind::Always, intensity, out);
+    for segment in &mut out[start..] {
+        segment.a = transform.transform_point3(segment.a);
+        segment.b = transform.transform_point3(segment.b);
+    }
+}
+
+fn append_model_occluder(
+    model: &VecModel,
+    transform: Mat4,
+    vertices: &mut Vec<Vec3>,
+    indices: &mut Vec<u32>,
+) {
+    let base = vertices.len() as u32;
+    vertices.extend(model.vertices.iter().map(|&v| transform.transform_point3(v)));
+    indices.extend(model.occluder_indices.iter().map(|&i| i + base));
+}
+
+fn append_telegraph_ring(at: Vec3, kind: EnemyKind, progress: f32, out: &mut Vec<Segment>) {
     let radius = 0.3 + kind.radius() * 2.2 * progress;
     let color = kind.color() * Vec4::new(1.0, 1.0, 1.0, 0.4 + 0.6 * progress);
-    ring_segments(at + Vec3::Y * 0.02, radius, color)
+    append_ring_segments(at + Vec3::Y * 0.02, radius, color, out);
 }
 
-fn ring_segments(center: Vec3, radius: f32, color: Vec4) -> Vec<Segment> {
+fn append_ring_segments(center: Vec3, radius: f32, color: Vec4, out: &mut Vec<Segment>) {
     const SIDES: usize = 14;
-    (0..SIDES)
-        .map(|i| {
-            let a = std::f32::consts::TAU * i as f32 / SIDES as f32;
-            let b = std::f32::consts::TAU * (i + 1) as f32 / SIDES as f32;
-            Segment::new(
-                center + vec3(a.cos() * radius, 0.0, a.sin() * radius),
-                center + vec3(b.cos() * radius, 0.0, b.sin() * radius),
-                color,
-            )
-        })
-        .collect()
+    for i in 0..SIDES {
+        let a = std::f32::consts::TAU * i as f32 / SIDES as f32;
+        let b = std::f32::consts::TAU * (i + 1) as f32 / SIDES as f32;
+        out.push(Segment::new(
+            center + vec3(a.cos() * radius, 0.0, a.sin() * radius),
+            center + vec3(b.cos() * radius, 0.0, b.sin() * radius),
+            color,
+        ));
+    }
 }
 
 // ------------------------------------------------------------------- hud --
@@ -504,11 +479,14 @@ fn ring_segments(center: Vec3, radius: f32, color: Vec4) -> Vec<Segment> {
 /// dim and additive — bloom melts them into a soft glow the color of the
 /// incoming fire. Left/right edges mean fire from that side; the bottom
 /// band means behind you (bolts ahead are their own indicator).
-fn threat_segments(viewport: Vec2, threats: &game::ThreatEdges) -> Vec<Segment> {
+fn append_threat_segments(
+    viewport: Vec2,
+    threats: &game::ThreatEdges,
+    out: &mut Vec<Segment>,
+) {
     // Inset per band and its share of the edge's urgency: the outermost
     // line burns hottest, the inner ones feather the glow inward.
     const BANDS: [(f32, f32); 3] = [(4.0, 0.55), (11.0, 0.33), (18.0, 0.18)];
-    let mut out = Vec::new();
     let (w, h) = (viewport.x, viewport.y);
     for (edge, warn) in threats.0.iter().enumerate() {
         if warn.w < 0.02 {
@@ -532,33 +510,33 @@ fn threat_segments(viewport: Vec2, threats: &game::ThreatEdges) -> Vec<Segment> 
             out.push(Segment::new(a, b, color));
         }
     }
-    out
 }
 
 /// The start screen in HUD space: title block, buttons that swell and
 /// brighten under the cursor, the options slider, and control hints.
 /// Geometry comes from the same [`menu::layout`] the hit tests use.
-fn menu_segments(state: &menu::Menu, viewport: Vec2) -> Vec<Segment> {
+fn append_menu_segments(state: &menu::Menu, viewport: Vec2, out: &mut Vec<Segment>) {
     let green = |w: f32| Vec4::new(0.62, 1.0, 0.68, w);
-    let mut out = Vec::new();
 
     // Title block in the upper third.
     let title_px = (viewport.x * 0.075).clamp(40.0, 88.0);
     let title_w = font::text_width(menu::TITLE, title_px);
-    out.extend(font::text_segments(
+    font::text_segments_into(
         menu::TITLE,
         vec2((viewport.x - title_w) * 0.5, viewport.y * 0.72),
         title_px,
         green(1.55),
-    ));
+        out,
+    );
     let sub_px = title_px * 0.36;
     let sub_w = font::text_width(menu::SUBTITLE, sub_px);
-    out.extend(font::text_segments(
+    font::text_segments_into(
         menu::SUBTITLE,
         vec2((viewport.x - sub_w) * 0.5, viewport.y * 0.72 - sub_px * 2.1),
         sub_px,
         Vec4::new(1.0, 0.32, 0.22, 1.15),
-    ));
+        out,
+    );
 
     for (i, item) in menu::layout(state.page, viewport).iter().enumerate() {
         let hover = state.hover[i];
@@ -569,12 +547,13 @@ fn menu_segments(state: &menu::Menu, viewport: Vec2) -> Vec<Segment> {
             (viewport.x - width) * 0.5,
             item.origin.y - (px - item.px) * 0.5,
         );
-        out.extend(font::text_segments(
+        font::text_segments_into(
             item.label,
             origin,
             px,
             green(0.7 + 1.3 * hover),
-        ));
+            out,
+        );
 
         if item.kind == menu::ItemKind::Slider {
             let (left, right) = menu::slider_track(item);
@@ -604,12 +583,13 @@ fn menu_segments(state: &menu::Menu, viewport: Vec2) -> Vec<Segment> {
             // Live multiplier readout beside the track.
             let readout =
                 format!("{:.0}%", menu::sensitivity_scale(state.sensitivity) * 100.0);
-            out.extend(font::text_segments(
+            font::text_segments_into(
                 &readout,
                 vec2(right.x + 26.0, y - 9.0),
                 18.0,
                 green(0.9),
-            ));
+                out,
+            );
         }
     }
 
@@ -617,25 +597,32 @@ fn menu_segments(state: &menu::Menu, viewport: Vec2) -> Vec<Segment> {
     let hint = "WASD MOVE - SPACE DASH - LMB FIRE";
     let hint_px = 13.0;
     let hint_w = font::text_width(hint, hint_px);
-    out.extend(font::text_segments(
+    font::text_segments_into(
         hint,
         vec2((viewport.x - hint_w) * 0.5, 34.0),
         hint_px,
         green(0.5),
-    ));
-    out
+        out,
+    );
 }
 
-fn hud_segments(viewport: Vec2, game: &Game, dash_ready: f32, extra_dash: bool) -> Vec<Segment> {
+fn append_hud_segments(
+    viewport: Vec2,
+    game: &Game,
+    dash_ready: f32,
+    extra_dash: bool,
+    out: &mut Vec<Segment>,
+) {
     let red = Vec4::new(phosphor::RED.x, phosphor::RED.y, phosphor::RED.z, 0.95);
     let lime = Vec4::new(phosphor::LIME.x, phosphor::LIME.y, phosphor::LIME.z, 0.9);
     let cyan = Vec4::new(phosphor::CYAN.x, phosphor::CYAN.y, phosphor::CYAN.z, 1.0);
 
-    let mut out = font::text_segments(
+    font::text_segments_into(
         &format!("HEALTH {:.0}", game.hp),
         vec2(28.0, 26.0),
         20.0,
         red,
+        out,
     );
     // Dash meter: a 10-second resource needs to be legible at a glance.
     let ready = dash_ready >= 1.0;
@@ -644,7 +631,7 @@ fn hud_segments(viewport: Vec2, game: &Game, dash_ready: f32, extra_dash: bool) 
     } else {
         Vec4::new(phosphor::CYAN.x, phosphor::CYAN.y, phosphor::CYAN.z, 0.45)
     };
-    out.extend(font::text_segments("DASH", vec2(28.0, 58.0), 12.0, dash_color));
+    font::text_segments_into("DASH", vec2(28.0, 58.0), 12.0, dash_color, out);
     let (bar_x, bar_y, bar_w) = (92.0, 63.0, 110.0);
     out.push(Segment::new(
         vec3(bar_x, bar_y, 0.0),
@@ -654,22 +641,24 @@ fn hud_segments(viewport: Vec2, game: &Game, dash_ready: f32, extra_dash: bool) 
     // Banked bonus dash from a boss bounty: the meter stays put when the
     // charge is spent, and this tag disappears with it.
     if extra_dash {
-        out.extend(font::text_segments(
+        font::text_segments_into(
             "X2",
             vec2(bar_x + bar_w + 12.0, 58.0),
             12.0,
             Vec4::new(phosphor::CYAN.x, phosphor::CYAN.y, phosphor::CYAN.z, 1.6),
-        ));
+            out,
+        );
     }
 
-    out.extend(font::text_segments(
+    font::text_segments_into(
         &format!("WAVE {}", game.wave),
         vec2(28.0, viewport.y - 46.0),
         20.0,
         lime,
-    ));
+        out,
+    );
     let score_text = format!("SCORE {}", game.score);
-    out.extend(font::text_segments(
+    font::text_segments_into(
         &score_text,
         vec2(
             viewport.x - font::text_width(&score_text, 20.0) - 28.0,
@@ -677,7 +666,8 @@ fn hud_segments(viewport: Vec2, game: &Game, dash_ready: f32, extra_dash: bool) 
         ),
         20.0,
         lime,
-    ));
+        out,
+    );
 
     // Crosshair.
     let center = viewport * 0.5;
@@ -708,7 +698,7 @@ fn hud_segments(viewport: Vec2, game: &Game, dash_ready: f32, extra_dash: bool) 
     // Banners.
     let mut banner = |text: &str, y: f32, size: f32, color: Vec4| {
         let x = (viewport.x - font::text_width(text, size)) * 0.5;
-        out.extend(font::text_segments(text, vec2(x, y), size, color));
+        font::text_segments_into(text, vec2(x, y), size, color, out);
     };
     match game.phase {
         Phase::Intermission { timer } => {
@@ -734,7 +724,6 @@ fn hud_segments(viewport: Vec2, game: &Game, dash_ready: f32, extra_dash: bool) 
         }
         Phase::Fighting => {}
     }
-    out
 }
 
 // ------------------------------------------------------------------- app --
@@ -819,6 +808,15 @@ struct ArenaApp {
     audio_failed: bool,
     /// The arena's own sound bank, handed to the engine to play.
     sounds: Sounds,
+    /// Reused CPU-side geometry buffers for the dynamic, weapon, and HUD
+    /// uploads. They grow to the largest frame and are cleared in place.
+    dynamic_segments: Vec<Segment>,
+    dynamic_vertices: Vec<Vec3>,
+    dynamic_indices: Vec<u32>,
+    weapon_segments: Vec<Segment>,
+    weapon_vertices: Vec<Vec3>,
+    weapon_indices: Vec<u32>,
+    hud_segments: Vec<Segment>,
 }
 
 impl ArenaApp {
@@ -906,6 +904,13 @@ impl ArenaApp {
             audio: None,
             audio_failed: false,
             sounds: Sounds::synth(),
+            dynamic_segments: Vec::new(),
+            dynamic_vertices: Vec::new(),
+            dynamic_indices: Vec::new(),
+            weapon_segments: Vec::new(),
+            weapon_vertices: Vec::new(),
+            weapon_indices: Vec::new(),
+            hud_segments: Vec::new(),
             screen: Screen::Menu,
             menu: menu::Menu::new(),
             menu_angle: 0.0,
@@ -1004,6 +1009,8 @@ impl ArenaApp {
     /// type. Same world passes and post chain as gameplay — the menu is
     /// just different segments in the HUD layer.
     fn draw_menu(&mut self, frame: &Frame) {
+        self.hud_segments.clear();
+        append_menu_segments(&self.menu, frame.viewport, &mut self.hud_segments);
         let Some(renderers) = self.renderers.as_mut() else {
             return;
         };
@@ -1049,7 +1056,7 @@ impl ArenaApp {
         renderers.hud_lines.set_segments(
             &frame.gpu.device,
             &frame.gpu.queue,
-            &menu_segments(&self.menu, frame.viewport),
+            &self.hud_segments,
         );
         let hud_uniform = CameraUniform::new(
             glam::camera::rh::proj::directx::orthographic(
@@ -1107,6 +1114,37 @@ impl ArenaApp {
     fn draw_game(&mut self, frame: &Frame) {
         // Computed before the renderers borrow (aim() takes &self).
         let threats = game::threat_edges(self.player.eye(), self.aim(), &self.game.bolts);
+        build_dynamic_into(
+            &self.models,
+            &self.game,
+            self.time,
+            &mut self.dynamic_segments,
+            &mut self.dynamic_vertices,
+            &mut self.dynamic_indices,
+        );
+        if let Some(weapon) = &self.weapon {
+            weapon.frame_geometry_into(
+                self.player.bob_phase(),
+                self.game.recoil(),
+                &mut self.weapon_segments,
+                &mut self.weapon_vertices,
+                &mut self.weapon_indices,
+            );
+            append_muzzle_flash(self.game.recoil(), &mut self.weapon_segments);
+        } else {
+            self.weapon_segments.clear();
+            self.weapon_vertices.clear();
+            self.weapon_indices.clear();
+        }
+        self.hud_segments.clear();
+        append_hud_segments(
+            frame.viewport,
+            &self.game,
+            self.player.dash_ready_fraction(),
+            self.player.extra_dash,
+            &mut self.hud_segments,
+        );
+        append_threat_segments(frame.viewport, &threats, &mut self.hud_segments);
         let Some(renderers) = self.renderers.as_mut() else {
             return;
         };
@@ -1141,18 +1179,16 @@ impl ArenaApp {
             }
         }
 
-        let (dynamic_segments, dynamic_vertices, dynamic_indices) =
-            build_dynamic(&self.models, &self.game, self.time);
         renderers.dynamic_lines.set_segments(
             &frame.gpu.device,
             &frame.gpu.queue,
-            &dynamic_segments,
+            &self.dynamic_segments,
         );
         renderers.dynamic_occluders.set_geometry(
             &frame.gpu.device,
             &frame.gpu.queue,
-            &dynamic_vertices,
-            &dynamic_indices,
+            &self.dynamic_vertices,
+            &self.dynamic_indices,
         );
 
         let world_uniform = CameraUniform::new(
@@ -1201,20 +1237,17 @@ impl ArenaApp {
             false,
         );
 
-        if let Some(weapon) = &self.weapon {
-            let (mut segments, vertices, indices) =
-                weapon.frame_geometry(self.player.bob_phase(), self.game.recoil());
+        if self.weapon.is_some() {
             // Muzzle flash lives in the weapon layer, pinned to the barrel
             // tip, so it never smears across the world near the camera.
-            segments.extend(muzzle_flash(self.game.recoil()));
             renderers
                 .weapon_lines
-                .set_segments(&frame.gpu.device, &frame.gpu.queue, &segments);
+                .set_segments(&frame.gpu.device, &frame.gpu.queue, &self.weapon_segments);
             renderers.weapon_occluders.set_geometry(
                 &frame.gpu.device,
                 &frame.gpu.queue,
-                &vertices,
-                &indices,
+                &self.weapon_vertices,
+                &self.weapon_indices,
             );
             let weapon_uniform = CameraUniform::new(
                 glam::camera::rh::proj::directx::perspective(
@@ -1252,16 +1285,7 @@ impl ArenaApp {
         renderers.hud_lines.set_segments(
             &frame.gpu.device,
             &frame.gpu.queue,
-            &{
-                let mut hud = hud_segments(
-                    frame.viewport,
-                    &self.game,
-                    self.player.dash_ready_fraction(),
-                    self.player.extra_dash,
-                );
-                hud.extend(threat_segments(frame.viewport, &threats));
-                hud
-            },
+            &self.hud_segments,
         );
         let hud_uniform = CameraUniform::new(
             glam::camera::rh::proj::directx::orthographic(
