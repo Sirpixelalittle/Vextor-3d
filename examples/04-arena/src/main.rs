@@ -273,6 +273,45 @@ fn build_dynamic(
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
+    // Boss bounties: a spinning cyan double-chevron — the dash glyph —
+    // bobbing over a slow claim ring.
+    for drop in &game.powerups {
+        let pop = smoothstep((drop.age / 0.35).min(1.0));
+        let transform = Mat4::from_translation(drop.center())
+            * Mat4::from_rotation_y(drop.age * 1.4)
+            * Mat4::from_scale(Vec3::splat(pop * 0.55));
+        let cyan = Vec4::new(0.35, 0.95, 1.0, 1.3 + 0.35 * (drop.age * 3.0).sin());
+        // Two nested chevrons pointing +X: "more dash".
+        let strokes = [
+            (vec3(-0.55, 0.7, 0.0), vec3(0.25, 0.0, 0.0)),
+            (vec3(0.25, 0.0, 0.0), vec3(-0.55, -0.7, 0.0)),
+            (vec3(0.15, 0.7, 0.0), vec3(0.95, 0.0, 0.0)),
+            (vec3(0.95, 0.0, 0.0), vec3(0.15, -0.7, 0.0)),
+        ];
+        for (a, b) in strokes {
+            segments.push(Segment::new(
+                transform.transform_point3(a),
+                transform.transform_point3(b),
+                cyan,
+            ));
+        }
+        // Claim ring on the floor, breathing with the bob.
+        let ring_r = 0.62 + (drop.age * 2.0).sin() * 0.05;
+        let ring_color = Vec4::new(0.35, 0.95, 1.0, 0.55);
+        const RING_STEPS: usize = 14;
+        for k in 0..RING_STEPS {
+            let (a0, a1) = (
+                std::f32::consts::TAU * k as f32 / RING_STEPS as f32,
+                std::f32::consts::TAU * (k + 1) as f32 / RING_STEPS as f32,
+            );
+            segments.push(Segment::new(
+                drop.pos + vec3(a0.cos() * ring_r, 0.04, a0.sin() * ring_r),
+                drop.pos + vec3(a1.cos() * ring_r, 0.04, a1.sin() * ring_r),
+                ring_color,
+            ));
+        }
+    }
+
     // The medkit: spinning cross hovering over a pulsing claim ring.
     if let Some(pack) = &game.health_pack {
         let pop = smoothstep((pack.age / 0.35).min(1.0));
@@ -575,7 +614,7 @@ fn menu_segments(state: &menu::Menu, viewport: Vec2) -> Vec<Segment> {
     out
 }
 
-fn hud_segments(viewport: Vec2, game: &Game, dash_ready: f32) -> Vec<Segment> {
+fn hud_segments(viewport: Vec2, game: &Game, dash_ready: f32, extra_dash: bool) -> Vec<Segment> {
     let red = Vec4::new(phosphor::RED.x, phosphor::RED.y, phosphor::RED.z, 0.95);
     let lime = Vec4::new(phosphor::LIME.x, phosphor::LIME.y, phosphor::LIME.z, 0.9);
     let cyan = Vec4::new(phosphor::CYAN.x, phosphor::CYAN.y, phosphor::CYAN.z, 1.0);
@@ -600,6 +639,16 @@ fn hud_segments(viewport: Vec2, game: &Game, dash_ready: f32) -> Vec<Segment> {
         vec3(bar_x + bar_w * dash_ready.clamp(0.0, 1.0), bar_y, 0.0),
         dash_color,
     ));
+    // Banked bonus dash from a boss bounty: the meter stays put when the
+    // charge is spent, and this tag disappears with it.
+    if extra_dash {
+        out.extend(font::text_segments(
+            "X2",
+            vec2(bar_x + bar_w + 12.0, 58.0),
+            12.0,
+            Vec4::new(phosphor::CYAN.x, phosphor::CYAN.y, phosphor::CYAN.z, 1.6),
+        ));
+    }
 
     out.extend(font::text_segments(
         &format!("WAVE {}", game.wave),
@@ -882,6 +931,7 @@ impl ArenaApp {
                 GameEvent::HealthPicked => audio.play(&self.sounds.health_pickup),
                 GameEvent::BossRing(at) => audio.play_at(&self.sounds.boss_ring, at),
                 GameEvent::Ricochet(at) => audio.play_at(&self.sounds.ricochet, at),
+                GameEvent::PowerUpPicked(at) => audio.play_at(&self.sounds.power_up, at),
             }
         }
     }
@@ -1189,8 +1239,12 @@ impl ArenaApp {
             &frame.gpu.device,
             &frame.gpu.queue,
             &{
-                let mut hud =
-                    hud_segments(frame.viewport, &self.game, self.player.dash_ready_fraction());
+                let mut hud = hud_segments(
+                    frame.viewport,
+                    &self.game,
+                    self.player.dash_ready_fraction(),
+                    self.player.extra_dash,
+                );
                 hud.extend(threat_segments(frame.viewport, &threats));
                 hud
             },
@@ -1299,6 +1353,13 @@ impl ArenaApp {
         self.game
             .update(dt, eye, aim, self.muzzle_world(), attack, &self.soup);
         let events = std::mem::take(&mut self.game.events);
+        // Gameplay side-effects first — play_events is sound-only and
+        // bails when audio is off, which must never eat a powerup.
+        for event in &events {
+            if matches!(event, GameEvent::PowerUpPicked(_)) {
+                self.player.grant_dash();
+            }
+        }
         self.play_events(events);
     }
 
@@ -1431,6 +1492,15 @@ fn screenshot(out: &Path, args: &[String]) -> Result<()> {
     if let Some(pack) = flag_value(args, "--pack") {
         let age: f32 = pack.parse().context("--pack expects an age in seconds")?;
         app.game.force_health_pack(age);
+    }
+    // Stage the boss bounty: a drop ahead of the player plus the banked
+    // X2 on the dash meter.
+    if args.iter().any(|a| a == "--powerup") {
+        let fwd = app.aim();
+        let fwd = vec3(fwd.x, 0.0, fwd.z).normalize_or_zero();
+        let at = vec3(app.player.pos.x, 0.0, app.player.pos.z) + fwd * 3.5;
+        app.game.force_power_up(at);
+        app.player.extra_dash = true;
     }
     // Stage incoming fire for threat-band shots: --bolt KIND,AZIMUTH,DIST
     // (azimuth degrees relative to facing: 90 = from the right, 180 =

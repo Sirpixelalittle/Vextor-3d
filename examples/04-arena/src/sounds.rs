@@ -19,6 +19,7 @@ pub struct Sounds {
     pub boss_ring: StaticSoundData,
     pub dash: StaticSoundData,
     pub ricochet: StaticSoundData,
+    pub power_up: StaticSoundData,
 }
 
 impl Sounds {
@@ -38,12 +39,13 @@ impl Sounds {
             boss_ring: boss_ring(),
             dash: dash(),
             ricochet: ricochet(),
+            power_up: power_up(),
         }
     }
 
     /// Every sound with its name — for the bank-wide audibility tests.
     #[cfg(test)]
-    fn all(&self) -> [(&'static str, &StaticSoundData); 12] {
+    fn all(&self) -> [(&'static str, &StaticSoundData); 13] {
         [
             ("shot", &self.shot),
             ("bolt_fire", &self.bolt_fire),
@@ -57,6 +59,7 @@ impl Sounds {
             ("boss_ring", &self.boss_ring),
             ("dash", &self.dash),
             ("ricochet", &self.ricochet),
+            ("power_up", &self.power_up),
         ]
     }
 }
@@ -145,6 +148,14 @@ fn ricochet() -> StaticSoundData {
     let edge = sweep_exp(0.09, 3900.0, 1700.0, 12.0, 0.10, saw);
     let snap = burst(0.03, 30.0, 0.18);
     to_sound(mix(mix(ping, &edge), &snap))
+}
+
+fn power_up() -> StaticSoundData {
+    // Boss bounty claimed: a firm step up into a bright airy rise —
+    // "charged", cousin to the dash whoosh it banks.
+    let step = sweep(0.07, 620.0, 620.0, 4.0, 0.34, square);
+    let rise = sweep_exp(0.18, 900.0, 1900.0, 5.5, 0.30, sine);
+    to_sound(append(step, rise))
 }
 
 fn game_over() -> StaticSoundData {

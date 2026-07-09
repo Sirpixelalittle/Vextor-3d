@@ -36,6 +36,11 @@ pub struct FpsController {
     /// Initial dash burst speed; travel distance ≈ speed / decay.
     pub dash_speed: f32,
     pub dash_decay: f32,
+    /// A banked bonus dash (powerups): the next dash consumes this
+    /// instead of starting the cooldown. Grant via [`grant_dash`].
+    ///
+    /// [`grant_dash`]: Self::grant_dash
+    pub extra_dash: bool,
     velocity_y: f32,
     grounded: bool,
     bob_phase: f32,
@@ -62,6 +67,7 @@ impl FpsController {
             dash_cooldown: 10.0,
             dash_speed: 26.0,
             dash_decay: 6.5,
+            extra_dash: false,
             velocity_y: 0.0,
             grounded: false,
             bob_phase: 0.0,
@@ -113,7 +119,14 @@ impl FpsController {
                 forward
             };
             self.dash_velocity = dir * self.dash_speed;
-            self.dash_timer = self.dash_cooldown;
+            if self.extra_dash {
+                // A banked bonus dash spends itself instead of the
+                // cooldown — the meter never moves, and the next dash is
+                // available immediately.
+                self.extra_dash = false;
+            } else {
+                self.dash_timer = self.dash_cooldown;
+            }
             self.dashed = true;
         }
         // The burst decays exponentially; it rides through the same
@@ -146,6 +159,17 @@ impl FpsController {
     }
 
     /// 0 → 1 dash recharge (1 = ready). Always 1 when the dash is off.
+    /// Bank a bonus dash (powerup pickup): if the dash is ready it's held
+    /// as an extra charge — the next dash spends the charge, not the
+    /// cooldown — otherwise it just finishes the recharge instantly.
+    pub fn grant_dash(&mut self) {
+        if self.dash_timer <= 0.0 {
+            self.extra_dash = true;
+        } else {
+            self.dash_timer = 0.0;
+        }
+    }
+
     pub fn dash_ready_fraction(&self) -> f32 {
         if self.dash_cooldown <= 0.0 {
             return 1.0;
@@ -237,6 +261,66 @@ mod tests {
             player.update(1.0 / 60.0, &input, &soup);
         }
         assert!(player.dash_ready_fraction() >= 1.0);
+    }
+
+    #[test]
+    fn banked_dash_spends_itself_not_the_cooldown() {
+        let soup = floor();
+        let mut player = FpsController::new(vec3(0.0, 0.0, 0.0), 0.0);
+        player.jump_enabled = false;
+        player.sprint_enabled = false;
+        player.dash_enabled = true;
+
+        // Granted while ready: banked as an extra charge.
+        player.grant_dash();
+        assert!(player.extra_dash);
+
+        // end_frame after each update, as the shell does — otherwise the
+        // held key's press edge would re-trigger next frame and spend the
+        // now-ready normal dash too.
+        let mut input = Input::default();
+        input.set_key(KeyCode::KeyW, true);
+        input.set_key(KeyCode::Space, true);
+        for _ in 0..10 {
+            player.update(1.0 / 60.0, &input, &soup);
+            input.end_frame();
+        }
+        assert!(player.just_dashed());
+        assert!(!player.extra_dash, "charge consumed");
+        assert!(
+            player.dash_ready_fraction() >= 1.0,
+            "the meter never moved: {}",
+            player.dash_ready_fraction()
+        );
+
+        // The very next press dashes again — and that one cools down.
+        input.end_frame();
+        input.set_key(KeyCode::Space, false);
+        input.end_frame();
+        input.set_key(KeyCode::Space, true);
+        player.update(1.0 / 60.0, &input, &soup);
+        assert!(player.just_dashed(), "second dash fired immediately");
+        assert!(player.dash_ready_fraction() < 0.2, "normal cooldown now");
+    }
+
+    #[test]
+    fn granting_mid_cooldown_just_refills() {
+        let soup = floor();
+        let mut player = FpsController::new(vec3(0.0, 0.0, 0.0), 0.0);
+        player.jump_enabled = false;
+        player.sprint_enabled = false;
+        player.dash_enabled = true;
+        let mut input = Input::default();
+        input.set_key(KeyCode::KeyW, true);
+        input.set_key(KeyCode::Space, true);
+        for _ in 0..10 {
+            player.update(1.0 / 60.0, &input, &soup);
+        }
+        assert!(player.dash_ready_fraction() < 1.0, "cooling down");
+
+        player.grant_dash();
+        assert!(!player.extra_dash, "no bank while recharging");
+        assert!(player.dash_ready_fraction() >= 1.0, "recharge finished");
     }
 
     #[test]

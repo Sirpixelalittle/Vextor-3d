@@ -57,6 +57,9 @@ const KILLS_PER_PACK: u32 = 10;
 const HEAL_AMOUNT: f32 = 35.0;
 const PACK_PICKUP_RADIUS: f32 = 1.0;
 
+// --- boss bounty ---
+const POWERUP_PICKUP_RADIUS: f32 = 1.1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnemyKind {
     Shard,
@@ -312,6 +315,26 @@ pub enum GameEvent {
     BossRing(Vec3),
     /// A slug glanced off the boss's sealed entrance shell.
     Ricochet(Vec3),
+    /// The player claimed a boss bounty (a banked bonus dash — the
+    /// presentation layer applies it to the controller).
+    PowerUpPicked(Vec3),
+}
+
+/// A boss bounty waiting on the floor where it died. For now every boss
+/// drops the same thing — a banked bonus dash — but the entity is the
+/// hook for the planned random single-use powerups.
+#[derive(Debug, Clone, Copy)]
+pub struct PowerUp {
+    /// Ground position (the pickup hovers above it).
+    pub pos: Vec3,
+    pub age: f32,
+}
+
+impl PowerUp {
+    /// Hover center for rendering and the pickup check.
+    pub fn center(&self) -> Vec3 {
+        self.pos + Vec3::Y * (1.0 + (self.age * 2.0).sin() * 0.08)
+    }
 }
 
 /// The medkit hovering at the arena center, waiting to be claimed.
@@ -345,6 +368,9 @@ pub struct Game {
     /// Drain with `std::mem::take` each frame.
     pub events: Vec<GameEvent>,
     pub health_pack: Option<HealthPack>,
+    /// Boss bounties on the floor (one per boss kill; they persist until
+    /// claimed).
+    pub powerups: Vec<PowerUp>,
     kills_toward_pack: u32,
     recoil: f32,
     fire_cooldown: f32,
@@ -370,6 +396,7 @@ impl Game {
             iframes: 0.0,
             events: Vec::new(),
             health_pack: None,
+            powerups: Vec::new(),
             kills_toward_pack: 0,
             recoil: 0.0,
             fire_cooldown: 0.0,
@@ -403,6 +430,7 @@ impl Game {
         self.enemies.clear();
         self.bolts.clear();
         self.bullets.clear();
+        self.powerups.clear();
         self.spawn_queue.clear();
     }
 
@@ -419,6 +447,12 @@ impl Game {
             color: vec4(tint.x, tint.y, tint.z, 1.7),
             damage: bolt_damage(self.wave),
         });
+    }
+
+    /// Drop a boss bounty at `pos` (staged screenshots; native only).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn force_power_up(&mut self, pos: Vec3) {
+        self.powerups.push(PowerUp { pos, age: 0.6 });
     }
 
     /// Spawn the medkit immediately (headless screenshots; native only).
@@ -473,6 +507,7 @@ impl Game {
         }
         self.update_enemies(dt, eye, soup);
         self.update_health_pack(dt, eye);
+        self.update_powerups(dt, eye);
 
         if matches!(self.phase, Phase::Fighting)
             && self.spawn_queue.is_empty()
@@ -660,6 +695,14 @@ impl Game {
             14,
         );
 
+        // Bosses drop a bounty where they die.
+        if enemy.kind == EnemyKind::Boss {
+            self.powerups.push(PowerUp {
+                pos: vec3(enemy.pos.x, 0.0, enemy.pos.z),
+                age: 0.0,
+            });
+        }
+
         // Earn a medkit every KILLS_PER_PACK kills. Overkill banks toward
         // the next one, so leaving a pack on the floor as a reserve is a
         // real strategy — but only one exists at a time.
@@ -672,6 +715,23 @@ impl Game {
             };
             self.events.push(GameEvent::HealthSpawned(pack.center()));
             self.health_pack = Some(pack);
+        }
+    }
+
+    /// Age bounties and hand them over on contact. Unlike the medkit they
+    /// never wait — banking or refilling a dash is always worth taking.
+    fn update_powerups(&mut self, dt: f32, eye: Vec3) {
+        let player_ground = vec3(eye.x, 0.0, eye.z);
+        let mut i = 0;
+        while i < self.powerups.len() {
+            self.powerups[i].age += dt;
+            if (player_ground - self.powerups[i].pos).length() < POWERUP_PICKUP_RADIUS {
+                let center = self.powerups[i].center();
+                self.powerups.swap_remove(i);
+                self.events.push(GameEvent::PowerUpPicked(center));
+                continue;
+            }
+            i += 1;
         }
     }
 
@@ -1354,6 +1414,60 @@ mod tests {
         assert!(
             !game.events.iter().any(|e| matches!(e, GameEvent::Ricochet(_))),
             "no ricochet off an arrived boss"
+        );
+    }
+
+    #[test]
+    fn dead_boss_drops_a_bounty_where_it_fell() {
+        let mut game = Game::new();
+        game.phase = Phase::Fighting;
+        game.wave = 10;
+        let mut boss = spawned(EnemyKind::Boss, vec3(0.0, 0.0, -8.0), 10);
+        boss.boss_cycle_start = Some(boss.age - 0.1);
+        boss.hp = 1.0;
+        game.enemies.push(boss);
+        game.update(0.016, EYE, AIM, MUZ, true, &open_soup());
+        settle_bullets(&mut game, &open_soup());
+        assert!(game.enemies.is_empty(), "boss died");
+        assert_eq!(game.powerups.len(), 1, "one bounty dropped");
+        let drop = game.powerups[0];
+        assert!(drop.pos.y.abs() < 1e-6, "on the floor");
+        assert!(
+            (drop.pos - vec3(0.0, 0.0, -8.0)).length() < 1.0,
+            "where it fell: {:?}",
+            drop.pos
+        );
+
+        // Lesser enemies drop nothing.
+        let mut shard = spawned(EnemyKind::Shard, vec3(0.0, 0.0, -6.0), 10);
+        shard.hp = 1.0;
+        game.enemies.push(shard);
+        game.update(0.016, EYE, AIM, MUZ, true, &open_soup());
+        settle_bullets(&mut game, &open_soup());
+        assert_eq!(game.powerups.len(), 1, "shards drop nothing");
+    }
+
+    #[test]
+    fn bounty_is_claimed_on_contact_and_never_waits() {
+        let mut game = Game::new();
+        game.phase = Phase::Fighting;
+        game.powerups.push(PowerUp {
+            pos: vec3(EYE.x, 0.0, EYE.z),
+            age: 0.0,
+        });
+        // Distant one stays put.
+        game.powerups.push(PowerUp {
+            pos: vec3(8.0, 0.0, 8.0),
+            age: 0.0,
+        });
+        game.update(0.016, EYE, AIM, MUZ, false, &open_soup());
+        assert_eq!(game.powerups.len(), 1, "underfoot bounty claimed");
+        assert!((game.powerups[0].pos - vec3(8.0, 0.0, 8.0)).length() < 1e-6);
+        assert!(
+            game.events
+                .iter()
+                .any(|e| matches!(e, GameEvent::PowerUpPicked(_))),
+            "pickup event for the presentation layer"
         );
     }
 
