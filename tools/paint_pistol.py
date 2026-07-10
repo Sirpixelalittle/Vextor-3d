@@ -13,6 +13,17 @@ the rest: emissive×strength → HDR stroke color, baseColor otherwise.
 Idempotent — it rewrites the materials array, so re-running on the
 already-painted glb is the retuning loop: edit PARTS below, rerun,
 look at a screenshot.
+
+Full regeneration from the pristine high-poly source
+(`assets/pistol_full.glb`, 122k tris) goes through decimation first —
+the full mesh is far too dense for a stroke viewmodel (see
+decimate_glb.py; needs a python with fast-simplification):
+
+    python tools/decimate_glb.py assets/pistol_full.glb /tmp/dec.glb 0.70
+    python3 tools/paint_pistol.py /tmp/dec.glb
+
+0.70 is the tuned reduction: deeper (0.82) turns the tank's screw
+circles into hexagons and leaves stray crease lines across flat faces.
 """
 
 import json
