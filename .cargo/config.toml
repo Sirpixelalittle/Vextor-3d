@@ -1,0 +1,6 @@
+# Cross-compiling to Windows from Linux: `rustup target add
+# x86_64-pc-windows-gnu` plus the mingw-w64-gcc package provide the std
+# and the linker below. Build with:
+#   cargo build --release --target x86_64-pc-windows-gnu -p arena
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"

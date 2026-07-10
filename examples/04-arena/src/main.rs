@@ -13,6 +13,11 @@
 //! dashes (10 s cooldown) · left click fires · \[R\] restarts · \[C\] CRT ·
 //! Esc releases the mouse.
 
+// Release builds on Windows are a game, not a console app — without this
+// the exe drags a terminal window around. Debug builds keep the console
+// so logs stay visible.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod game;
 mod menu;
 mod sounds;
